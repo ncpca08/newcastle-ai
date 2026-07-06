@@ -1,0 +1,5 @@
+streamlit>=1.36
+requests>=2.31
+pandas>=2.0
+python-dateutil>=2.9
+Pillow>=10.0
