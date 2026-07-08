@@ -512,7 +512,7 @@ def offer_composer(subject, tiers, seller_name, seller_phone, address):
 
 def analyze_page(user):
     st.title("🏠 Newcastle AI Acquisition Analyzer")
-    st.caption("Realie-powered: verified comps → value tiers → purchase guide → offer composer")
+    st.caption("Realie-powered: verified comps → top 6 comp selection → value tiers → offer composer")
     if "property_address" not in st.session_state:
         st.session_state.property_address = "1342 Branham Ln #1, San Jose, CA 95118"
     address = st.text_input("Property Address", key="property_address")
@@ -540,13 +540,19 @@ def analyze_page(user):
             all_rows = comp_rows(subject, comps)
             six_month_rows = [r for r in all_rows if months_ago(r.get("_sold_dt")) <= 6]
             if len(six_month_rows) > 3:
-                rows = six_month_rows
-                visible_rule = "Strict: newest verified sales only / same property type / ±300 sqft / 6 months"
+                pool = six_month_rows
+                visible_rule = "Strict: top 6 verified sales / same property type / ±300 sqft / 6 months"
             else:
-                rows = [r for r in all_rows if months_ago(r.get("_sold_dt")) <= 12]
-                visible_rule = "Backup: 12 months used because 3 or fewer 6-month comps were found"
+                pool = [r for r in all_rows if months_ago(r.get("_sold_dt")) <= 12]
+                visible_rule = "Backup: top 6 verified sales / 12 months used because 3 or fewer 6-month comps were found"
+
+            # Select only the best 5-6 comps for both display and ARV.
+            # Selection is by match score first, then recency. Final display is newest sold first.
+            selected = sorted(pool, key=lambda r: (r.get("Match", 0), r.get("_sold_dt")), reverse=True)[:6]
+            rows = sorted(selected, key=lambda r: r.get("_sold_dt"), reverse=True)
+
             tiers = arv_tiers(rows)
-            st.session_state.analysis = {"subject": subject, "rows": rows, "tiers": tiers, "rule": visible_rule, "debug": debug}
+            st.session_state.analysis = {"subject": subject, "rows": rows, "tiers": tiers, "rule": visible_rule, "debug": debug, "pool_count": len(pool), "six_count": len(six_month_rows)}
     analysis = st.session_state.get("analysis")
     if analysis:
         subject = analysis["subject"]; rows = analysis["rows"]; tiers = analysis["tiers"]; rule = analysis["rule"]
@@ -564,7 +570,7 @@ def analyze_page(user):
             c[1].metric("Expected ARV", money(tiers["market"]))
             c[2].metric("Aggressive ARV", money(tiers["premium"]))
             c[3].metric("Confidence", f"{tiers['confidence']}%")
-            st.caption(f"Comps used for ARV: {len(tiers['used'])} | Verified comps shown: {len(rows)} | Rule: {rule}")
+            st.caption(f"Comps used for ARV: {len(tiers['used'])} | Best comps shown: {len(rows)} of {analysis.get('pool_count', len(rows))} qualified | 6-month comps found: {analysis.get('six_count', '—')} | Rule: {rule}")
             with st.expander("Optional purchase guide", expanded=False):
                 st.caption("These are not buyer resale prices. They are quick acquisition reference points using the Conservative ARV. Final offer should account for repairs, fees, holding costs, and desired profit.")
                 base = tiers["quick_sale"]
@@ -573,9 +579,9 @@ def analyze_page(user):
                 for col, (label, pct) in zip(cols, labels):
                     col.metric(label, money(base * pct))
         st.header("Comparable Sales")
-        st.caption("Same property type locked. Only 6-month comps are shown unless there are 3 or fewer, then 12-month backup is used. Sorted newest verified sale first.")
+        st.caption("Same property type locked. The app pulls a larger pool in the background, selects only the best 5–6 verified comps by match score, then displays them newest sold first. 12-month backup is used only when 6-month comps are too limited.")
         display = []
-        for r in rows[:50]:
+        for r in rows[:6]:
             display.append({
                 "Address": r["Address"], "Sold Date": r["Sold Date"], "Sold Price": money(r["Sold Price"]), "$/SF": money(r["$/SF"]),
                 "SqFt": int(r["SqFt"] or 0), "Beds": r["Beds"], "Baths": r["Baths"], "Distance": f"{r['Distance']:.2f} mi" if r["Distance"] else "—",
@@ -583,7 +589,7 @@ def analyze_page(user):
             })
         st.dataframe(pd.DataFrame(display), use_container_width=True, hide_index=True)
         st.header("Clickable Comp Details")
-        for idx, r in enumerate(rows[:10], start=1):
+        for idx, r in enumerate(rows[:6], start=1):
             with st.expander(f"{idx}. {r['Address']} — {money(r['Sold Price'])} — Match {int(r['Match'])}%"):
                 raw = r["_raw"]
                 st.write(f"**Buyer / Current Owner:** {r['Buyer / Current Owner']}")
