@@ -1,13 +1,12 @@
 # Newcastle AI Acquisition Analyzer
 
-Adds a temporary DealMachine API tester in the Streamlit sidebar.
+Patch: removes DealMachine API tester and removes active DealMachine API calls from the app.
 
-Secrets required:
+Keep only supported API keys in Streamlit Secrets, for example:
 
 ```toml
-RENTCAST_API_KEY = "..."
-DEALMACHINE_API_KEY = "..."
-DEALRUN_API_KEY = "..."
+RENTCAST_API_KEY = "your_rentcast_key"
+DEALRUN_API_KEY = "your_dealrun_key"
 ```
 
-Upload app.py, README.md, and requirements.txt to GitHub. Do not upload __pycache__.
+Do not keep `DEALMACHINE_API_KEY` in Streamlit Secrets unless DealMachine provides official public API documentation/permission.

@@ -19,7 +19,6 @@ def get_secret(name: str, default: str = "") -> str:
         return default
 
 RENTCAST_API_KEY = get_secret("RENTCAST_API_KEY")
-DEALMACHINE_API_KEY = get_secret("DEALMACHINE_API_KEY")
 DEALRUN_API_KEY = get_secret("DEALRUN_API_KEY")
 
 # -------------------------
@@ -600,61 +599,6 @@ def dealrun_request(base_url: str, path: str, method: str = "GET", auth_mode: st
         return {"ok": False, "url_tested": url, "auth_mode": auth_mode, "method": method, "error": str(e)}
 
 
-def dealmachine_request(base_url: str, path: str, method: str = "GET", auth_mode: str = "Bearer token", address: str = ""):
-    """Small safe tester to discover DealMachine API behavior without exposing the key."""
-    if not DEALMACHINE_API_KEY:
-        return {"ok": False, "error": "Missing DEALMACHINE_API_KEY in Streamlit secrets."}
-
-    base_url = (base_url or "").strip().rstrip("/")
-    path = (path or "").strip()
-    if not path.startswith("/"):
-        path = "/" + path
-    url = base_url + path
-
-    headers = {"Accept": "application/json"}
-    params = {}
-    json_body = None
-
-    if auth_mode == "Bearer token":
-        headers["Authorization"] = f"Bearer {DEALMACHINE_API_KEY}"
-    elif auth_mode == "X-API-Key":
-        headers["X-API-Key"] = DEALMACHINE_API_KEY
-    elif auth_mode == "api_key query":
-        params["api_key"] = DEALMACHINE_API_KEY
-    elif auth_mode == "Token header":
-        headers["Authorization"] = f"Token {DEALMACHINE_API_KEY}"
-    elif auth_mode == "Authorization raw":
-        headers["Authorization"] = DEALMACHINE_API_KEY
-
-    if address:
-        if method == "GET":
-            params["address"] = address
-        else:
-            headers["Content-Type"] = "application/json"
-            json_body = {"address": address}
-
-    try:
-        if method == "GET":
-            r = requests.get(url, headers=headers, params=params, timeout=20)
-        else:
-            r = requests.post(url, headers=headers, params=params, json=json_body, timeout=20)
-        body_text = r.text or ""
-        try:
-            parsed = r.json()
-        except Exception:
-            parsed = None
-        return {
-            "ok": 200 <= r.status_code < 300,
-            "status_code": r.status_code,
-            "url_tested": url,
-            "auth_mode": auth_mode,
-            "method": method,
-            "content_type": r.headers.get("content-type", ""),
-            "body_preview": body_text[:3000],
-            "json": parsed if isinstance(parsed, (dict, list)) else None,
-        }
-    except Exception as e:
-        return {"ok": False, "url_tested": url, "auth_mode": auth_mode, "method": method, "error": str(e)}
 
 # -------------------------
 # SAMPLE DATA FOR PREVIEW
@@ -825,22 +769,6 @@ with st.sidebar:
         st.write("DealRun test result")
         st.json(result)
 
-    st.divider()
-    st.header("DealMachine API Test")
-    st.caption("Temporary tester. Uses DEALMACHINE_API_KEY from Streamlit Secrets.")
-    dm_base = st.selectbox(
-        "DealMachine Base URL",
-        ["https://api.dealmachine.com", "https://api.dealmachine.com/v1", "https://app.dealmachine.com/api", "https://api.dealmachine.com/public"],
-        index=0,
-    )
-    dm_path = st.text_input("DealMachine endpoint path", value="/", help="Start with /, then try /api, /v1, /properties, /property, /leads, /owners")
-    dm_method = st.selectbox("DealMachine method", ["GET", "POST"], index=0)
-    dm_auth = st.selectbox("DealMachine auth style", ["Bearer token", "X-API-Key", "Token header", "api_key query", "Authorization raw"], index=0)
-    dm_addr = st.text_input("DealMachine optional test address", value="1338 Branham Ln #1, San Jose, CA 95118")
-    if st.button("Test DealMachine API", use_container_width=True):
-        result = dealmachine_request(dm_base, dm_path, dm_method, dm_auth, dm_addr)
-        st.write("DealMachine test result")
-        st.json(result)
 
 
 col1, col2 = st.columns([2, 1])
