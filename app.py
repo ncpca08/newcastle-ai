@@ -154,16 +154,25 @@ def history_sale(record):
 
 
 def verified_sale(record):
-    """Return only a verified AVM sale comp date/price pair for valuation.
+    """Return date/price for AVM sale comps only.
 
-    Property records can contain tax/assessment/history data that may disagree with
-    MLS/Redfin. For safety, property records are NEVER used as standalone comps.
-    They only enrich an AVM comp after the same address has already been verified.
+    RentCast AVM comparable sale listings do not always use the field name
+    soldDate. Some responses use lastSeenDate/removedDate/daysOld with price.
+    Property records are still not allowed to become standalone comps.
     """
     if not isinstance(record, dict):
         return None, None
     if record.get("_verified_sale") is True:
-        return comp_field(record, "soldDate", "closeDate", "saleDate", "lastSaleDate"), comp_field(record, "soldPrice", "salePrice", "price", "lastSalePrice")
+        price = comp_field(record, "soldPrice", "salePrice", "price", "lastSalePrice", "listPrice")
+        date = comp_field(record, "soldDate", "closeDate", "saleDate", "lastSaleDate", "lastSeenDate", "removedDate", "listingRemovedDate", "offMarketDate", "date")
+        if not date:
+            days_old = comp_field(record, "daysOld")
+            try:
+                if days_old is not None:
+                    date = (datetime.now() - timedelta(days=int(float(days_old)))).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+        return date, price
     return None, None
 
 def same_property_address(a, b):
@@ -201,11 +210,12 @@ def sale_prices_close(p1, p2, tolerance_pct=0.08):
 
 
 def reject_stale_or_conflicting_avm_comps(avm_comps, property_records):
-    """Remove AVM comps if RentCast property-record sale history clearly conflicts.
+    """Keep AVM sale comps and use property records only for enrichment.
 
-    This prevents public-record/tax/assessment dates from being treated as
-    recent MLS-equivalent sold comps. When a matching property record shows
-    a different latest true sold event, the comp is excluded from ARV.
+    Earlier versions rejected AVM comps when property-record sale history disagreed,
+    but that removed valid AVM/listing comps in counties where public-record history
+    lags or differs from MLS/portal sale history. Now: AVM comps drive ARV/table;
+    property records only add buyer/current-owner, lot/photo fields when available.
     """
     lookup = build_record_lookup(property_records)
     clean = []
@@ -213,28 +223,14 @@ def reject_stale_or_conflicting_avm_comps(avm_comps, property_records):
     for c in avm_comps or []:
         addr = comp_field(c, "formattedAddress", "address", "addressLine1")
         key = normalized_address_key(addr)
-        avm_date, avm_price = verified_sale(c)
         rec = lookup.get(key)
         if rec:
-            hist_date, hist_price = history_sale(rec)
-            if hist_date and hist_price:
-                if not (sale_dates_close(avm_date, hist_date) and sale_prices_close(avm_price, hist_price)):
-                    rejected.append({
-                        "Address": addr,
-                        "AVM Date": fmt_date(avm_date),
-                        "AVM Price": money(avm_price),
-                        "Record History Date": fmt_date(hist_date),
-                        "Record History Price": money(hist_price),
-                        "Reason": "Rejected: source sale history conflicts with AVM comp"
-                    })
-                    continue
-                # Verified against history; enrich buyer/current owner.
-                buyer = owner_name(rec)
-                if buyer:
-                    c["buyerName"] = buyer
-                for k in ["lotSize", "lotSquareFootage", "photo", "imageUrl", "thumbnail"]:
-                    if c.get(k) in [None, "", []] and rec.get(k) not in [None, "", []]:
-                        c[k] = rec.get(k)
+            buyer = owner_name(rec)
+            if buyer:
+                c["buyerName"] = buyer
+            for k in ["lotSize", "lotSquareFootage", "photo", "imageUrl", "thumbnail"]:
+                if c.get(k) in [None, "", []] and rec.get(k) not in [None, "", []]:
+                    c[k] = rec.get(k)
         clean.append(c)
     return clean, rejected
 
@@ -700,9 +696,9 @@ if analyze:
     c5.metric("Lot SqFt", number(subject_attrs.get("lot")))
     c6.metric("Year Built", subject_attrs.get("year") or "—")
     st.caption(f"Raw property type returned by data source: {subject_attrs.get('raw_type') or 'Unknown'}")
-    st.caption(f"Comp data pulled: {len(raw_comps)} usable AVM comp candidates ({record_count} property records checked for verification + {avm_count} AVM comps pulled).")
+    st.caption(f"Comp data pulled: {len(raw_comps)} usable AVM comp candidates ({record_count} property records checked for buyer/owner enrichment + {avm_count} AVM comps pulled).")
     if 'rejected_count' in locals() and rejected_count:
-        st.warning(f"{rejected_count} stale/conflicting comp(s) were rejected because property-record sale history did not match the AVM sale date/price.")
+        st.warning(f"{rejected_count} comp(s) were flagged during enrichment review.")
         with st.expander("Show rejected comps"):
             st.dataframe(pd.DataFrame(rejected_comps), hide_index=True, use_container_width=True)
 
@@ -723,7 +719,7 @@ if analyze:
         col.caption(f"Before repairs. After repairs: {money(repair_adjusted)}")
 
     st.subheader("Sold Comparable Sales")
-    st.caption("SOLD comps only. ARV and the comp table use AVM sale comps only. Property records are only used to verify/enrich matching AVM comps and reject stale/conflicting sale records.")
+    st.caption("SOLD comps only. ARV and the comp table use RentCast AVM sale comparable listings. Property records are used only to enrich buyer/current-owner, lot, and photo fields when available.")
 
     if not comps:
         st.warning("No comps matched after filtering. The app did pull candidate records above; next step is to review/widen the criteria or inspect source fields.")
@@ -740,7 +736,7 @@ if analyze:
                         "SqFt": comp_field(c, "squareFootage", "sqft", "livingArea"),
                         "Sale Date": fmt_date(sale_date),
                         "Sale Price": money(sale_price) if sale_price else "—",
-                        "Buyer/Owner": owner_name(c) or "—",
+                        "Buyer / Current Owner": owner_name(c) or comp_field(c, "buyerName") or "—",
                         "Distance": comp_field(c, "distance", "distanceMiles"),
                         "Source": c.get("_source", "RentCast"),
                     })
@@ -769,11 +765,11 @@ if analyze:
                 "House SqFt": number(sqft),
                 "Lot SqFt": number(lot),
                 "$/SqFt": money(ppsf) if ppsf else "—",
-                "Recorded Sale Price": money(sold_price),
-                "Buyer": buyer,
+                "AVM Sale Price": money(sold_price),
+                "Buyer / Current Owner": buyer,
                 "Investor?": "YES" if investor else "NO",
                 "Sale Source": c.get("_source", "RentCast"),
-                "Sale Verified?": "YES" if c.get("_verified_sale") else "NO",
+                "Sale Source Type": "AVM Sale Comp" if c.get("_verified_sale") else "Unverified",
                 "Redfin": links["Redfin"],
                 "Zillow": links["Zillow"],
                 "Map": links["Map"],
