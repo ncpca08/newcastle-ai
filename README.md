@@ -1,12 +1,19 @@
-# Newcastle AI Acquisition Analyzer
+# Newcastle AI - Repliers API Tester Patch
 
-Patch: removes DealMachine API tester and removes active DealMachine API calls from the app.
+Adds a temporary Repliers API tester to the Streamlit sidebar.
 
-Keep only supported API keys in Streamlit Secrets, for example:
+## Add to Streamlit Secrets
 
 ```toml
-RENTCAST_API_KEY = "your_rentcast_key"
-DEALRUN_API_KEY = "your_dealrun_key"
+REPLIERS_API_KEY = "your_repliers_key_here"
 ```
 
-Do not keep `DEALMACHINE_API_KEY` in Streamlit Secrets unless DealMachine provides official public API documentation/permission.
+Keep your existing RentCast key. DealRun can stay or be removed later.
+
+## First test
+- Base URL: `https://api.repliers.io`
+- Endpoint path: `/`
+- Method: `GET`
+- Auth style: `X-API-Key`
+
+If that fails, try `REPLIERS-API-KEY`, `Authorization Bearer`, and `api_key query`.

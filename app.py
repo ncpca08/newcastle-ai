@@ -20,6 +20,7 @@ def get_secret(name: str, default: str = "") -> str:
 
 RENTCAST_API_KEY = get_secret("RENTCAST_API_KEY")
 DEALRUN_API_KEY = get_secret("DEALRUN_API_KEY")
+REPLIERS_API_KEY = get_secret("REPLIERS_API_KEY")
 
 # -------------------------
 # STYLE
@@ -739,6 +740,54 @@ def calculate_arv(comps, subject_sqft, avm_data=None):
     arv = avg_psf * float(subject_sqft) if avg_psf and subject_sqft else median_price
     return arv, avg_psf, median_price
 
+
+def test_repliers_api(base_url: str, endpoint: str, method: str, auth_style: str, address: str):
+    if not REPLIERS_API_KEY:
+        return {"ok": False, "error": "Missing REPLIERS_API_KEY in Streamlit secrets."}
+
+    base_url = base_url.rstrip("/")
+    endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
+    url = f"{base_url}{endpoint}"
+    headers = {"Accept": "application/json"}
+    params = {}
+
+    if auth_style == "X-API-Key":
+        headers["X-API-Key"] = REPLIERS_API_KEY
+    elif auth_style == "REPLIERS-API-KEY":
+        headers["REPLIERS-API-KEY"] = REPLIERS_API_KEY
+    elif auth_style == "Authorization Bearer":
+        headers["Authorization"] = f"Bearer {REPLIERS_API_KEY}"
+    elif auth_style == "Authorization Token":
+        headers["Authorization"] = f"Token {REPLIERS_API_KEY}"
+    elif auth_style == "api_key query":
+        params["api_key"] = REPLIERS_API_KEY
+
+    if address:
+        params.update({"address": address, "query": address, "q": address})
+
+    try:
+        if method == "GET":
+            r = requests.get(url, headers=headers, params=params, timeout=30)
+        else:
+            payload = {"address": address} if address else {}
+            r = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=payload, params=params, timeout=30)
+        out = {
+            "ok": 200 <= r.status_code < 300,
+            "status_code": r.status_code,
+            "url_tested": r.url.replace(REPLIERS_API_KEY, "***"),
+            "auth_mode": auth_style,
+            "method": method,
+            "content_type": r.headers.get("content-type", ""),
+            "body_preview": r.text[:5000],
+        }
+        try:
+            out["json"] = r.json()
+        except Exception:
+            out["json"] = None
+        return out
+    except Exception as e:
+        return {"ok": False, "url_tested": url, "auth_mode": auth_style, "method": method, "error": str(e)}
+
 # -------------------------
 # UI
 # -------------------------
@@ -767,6 +816,27 @@ with st.sidebar:
     if st.button("Test DealRun API", use_container_width=True):
         result = dealrun_request(dealrun_base, dealrun_path, dealrun_method, dealrun_auth, dealrun_addr)
         st.write("DealRun test result")
+        st.json(result)
+
+    st.divider()
+    st.header("Repliers API Test")
+    st.caption("Temporary tester. Add REPLIERS_API_KEY in Streamlit Secrets first.")
+    repliers_base = st.selectbox(
+        "Repliers Base URL",
+        ["https://api.repliers.io", "https://api.repliers.com", "https://api.repliers.io/v1"],
+        index=0,
+    )
+    repliers_path = st.text_input("Repliers endpoint path", value="/", help="Start with /. Then try /listings or a documented endpoint if Repliers provides one.")
+    repliers_method = st.selectbox("Repliers method", ["GET", "POST"], index=0)
+    repliers_auth = st.selectbox(
+        "Repliers auth style",
+        ["X-API-Key", "REPLIERS-API-KEY", "Authorization Bearer", "Authorization Token", "api_key query"],
+        index=0,
+    )
+    repliers_addr = st.text_input("Repliers optional test address", value="1342 Branham Ln #1, San Jose, CA 95118")
+    if st.button("Test Repliers API", use_container_width=True):
+        result = test_repliers_api(repliers_base, repliers_path, repliers_method, repliers_auth, repliers_addr)
+        st.write("Repliers test result")
         st.json(result)
 
 
