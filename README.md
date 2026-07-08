@@ -1,12 +1,18 @@
-# Newcastle AI Acquisition Analyzer - Verified Comps Fix
+# Newcastle AI - Comp Validation + Offer Fix
 
-This patch fixes stale/incorrect comp prices by separating valuation comps from enrichment records.
+Fixes two issues:
 
-## What changed
-- ARV/comp table now prioritizes verified RentCast AVM sale comps.
-- RentCast property records are used for buyer/current-owner enrichment only.
-- Property record prices/dates no longer overwrite verified sale comp prices/dates.
-- Adds Sale Source and Sale Verified columns.
-- Keeps property-type matching: condo/townhome vs SFR vs multifamily.
+1. **Offer Matrix** now shows the true gross ARV percentages:
+   - 75% ARV = ARV × 0.75
+   - 70% ARV = ARV × 0.70
+   - 65% ARV = ARV × 0.65
+   - 60% ARV = ARV × 0.60
 
-Upload `app.py` and `requirements.txt` to GitHub and commit changes.
+   Repair-adjusted values are shown underneath each tier instead of replacing the tier number.
+
+2. **Comp validation** now rejects stale/conflicting sale records:
+   - Property records are not allowed to create comps.
+   - AVM sale comps are checked against matching property-record sale history when available.
+   - If the record history conflicts with the AVM sale date/price, the comp is rejected and shown in a troubleshooting expander.
+
+Upload these files to GitHub and replace the existing app.py.

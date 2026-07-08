@@ -154,26 +154,89 @@ def history_sale(record):
 
 
 def verified_sale(record):
-    """Return only a sale date/price pair that is safe to use for valuation.
+    """Return only a verified AVM sale comp date/price pair for valuation.
 
-    Important: RentCast property records can include dates/prices that do not match
-    MLS/Redfin sale history. We therefore use property records mainly for owner/buyer
-    enrichment and use AVM sale comparables for ARV unless a true sale-history event
-    is available.
+    Property records can contain tax/assessment/history data that may disagree with
+    MLS/Redfin. For safety, property records are NEVER used as standalone comps.
+    They only enrich an AVM comp after the same address has already been verified.
     """
     if not isinstance(record, dict):
         return None, None
     if record.get("_verified_sale") is True:
         return comp_field(record, "soldDate", "closeDate", "saleDate", "lastSaleDate"), comp_field(record, "soldPrice", "salePrice", "price", "lastSalePrice")
-    if record.get("_source") == "RentCast Records - Owner Enrichment":
-        return history_sale(record)
-    # Default fallback for AVM/listing comparable records only.
-    return comp_field(record, "soldDate", "closeDate", "saleDate"), comp_field(record, "soldPrice", "salePrice", "price")
+    return None, None
 
 def same_property_address(a, b):
     def clean(x):
         return re.sub(r"[^A-Z0-9]", "", str(x or "").upper())
     return clean(a) and clean(a) == clean(b)
+
+
+def normalized_address_key(addr):
+    return re.sub(r"[^A-Z0-9]", "", str(addr or "").upper())
+
+
+def build_record_lookup(records):
+    lookup = {}
+    for rec in records or []:
+        addr = comp_field(rec, "formattedAddress", "address", "addressLine1")
+        key = normalized_address_key(addr)
+        if key:
+            lookup[key] = rec
+    return lookup
+
+
+def sale_dates_close(d1, d2, max_days=45):
+    dt1, dt2 = parse_date(d1), parse_date(d2)
+    if not dt1 or not dt2:
+        return False
+    return abs((dt1 - dt2).days) <= max_days
+
+
+def sale_prices_close(p1, p2, tolerance_pct=0.08):
+    p1, p2 = safe_float(p1), safe_float(p2)
+    if not p1 or not p2:
+        return False
+    return abs(p1 - p2) / max(p1, p2) <= tolerance_pct
+
+
+def reject_stale_or_conflicting_avm_comps(avm_comps, property_records):
+    """Remove AVM comps if RentCast property-record sale history clearly conflicts.
+
+    This prevents public-record/tax/assessment dates from being treated as
+    recent MLS-equivalent sold comps. When a matching property record shows
+    a different latest true sold event, the comp is excluded from ARV.
+    """
+    lookup = build_record_lookup(property_records)
+    clean = []
+    rejected = []
+    for c in avm_comps or []:
+        addr = comp_field(c, "formattedAddress", "address", "addressLine1")
+        key = normalized_address_key(addr)
+        avm_date, avm_price = verified_sale(c)
+        rec = lookup.get(key)
+        if rec:
+            hist_date, hist_price = history_sale(rec)
+            if hist_date and hist_price:
+                if not (sale_dates_close(avm_date, hist_date) and sale_prices_close(avm_price, hist_price)):
+                    rejected.append({
+                        "Address": addr,
+                        "AVM Date": fmt_date(avm_date),
+                        "AVM Price": money(avm_price),
+                        "Record History Date": fmt_date(hist_date),
+                        "Record History Price": money(hist_price),
+                        "Reason": "Rejected: source sale history conflicts with AVM comp"
+                    })
+                    continue
+                # Verified against history; enrich buyer/current owner.
+                buyer = owner_name(rec)
+                if buyer:
+                    c["buyerName"] = buyer
+                for k in ["lotSize", "lotSquareFootage", "photo", "imageUrl", "thumbnail"]:
+                    if c.get(k) in [None, "", []] and rec.get(k) not in [None, "", []]:
+                        c[k] = rec.get(k)
+        clean.append(c)
+    return clean, rejected
 
 
 def maps_links(address: str):
@@ -391,7 +454,10 @@ def merge_comps(*lists):
             addr = item.get("formattedAddress") or item.get("address") or item.get("addressLine1") or str(item)
             key = re.sub(r"[^A-Z0-9]", "", str(addr).upper())
             if key not in merged:
-                merged[key] = item
+                # Do not allow property records/history records to become standalone comps.
+                # They are only allowed to enrich a verified AVM sale comp with the same address.
+                if item.get("_verified_sale") is True:
+                    merged[key] = item
                 continue
 
             existing = dict(merged[key])
@@ -593,8 +659,9 @@ if analyze:
         subject_record, avm_data, err = sample_result()
         subject_attrs = get_subject_attrs(subject_record, avm_data)
         raw_comps = [normalize_comp_record(c, subject_attrs, source="Sample AVM Sale Comp", verified_sale_comp=True) for c in extract_comps(avm_data)]
-        record_count = len(raw_comps)
+        record_count = 0
         avm_count = len(raw_comps)
+        rejected_count = 0
     else:
         subject_record, err = get_property_record(address)
         if err: errors.append(err)
@@ -604,17 +671,19 @@ if analyze:
 
         avm_comps = [normalize_comp_record(c, subject_attrs, source="RentCast AVM Sale Comp", verified_sale_comp=True) for c in extract_comps(avm_data)]
 
-        # Pull detailed SOLD comps from RentCast Property Records. This is what gives us
-        # last sale price/date and current owner/buyer names for the comp table.
+        # Property Records are NOT allowed to create comps or ARV.
+        # They are used only to verify/enrich AVM sale comps and reject stale/conflicting records.
         record_comps_12, err = get_sold_property_records(address, subject_attrs, radius=1.0, days=365, sqft_tolerance=700, strict_type=True, strict_beds=False, strict_baths=False)
         if err: errors.append(err)
         record_comps_24, err = get_sold_property_records(address, subject_attrs, radius=1.5, days=730, sqft_tolerance=900, strict_type=True, strict_beds=False, strict_baths=False) if len(record_comps_12) < min_comps else ([], None)
         if err: errors.append(err)
-        record_comps = [normalize_comp_record(c, subject_attrs, source="RentCast Records - Owner Enrichment", verified_sale_comp=False) for c in (record_comps_12 + record_comps_24)]
+        record_comps_raw = record_comps_12 + record_comps_24
 
-        raw_comps = merge_comps(record_comps, avm_comps)
-        record_count = len(record_comps)
+        verified_avm_comps, rejected_comps = reject_stale_or_conflicting_avm_comps(avm_comps, record_comps_raw)
+        raw_comps = verified_avm_comps
+        record_count = len(record_comps_raw)
         avm_count = len(avm_comps)
+        rejected_count = len(rejected_comps)
 
     comps, comp_window = find_best_comps(raw_comps, subject_attrs, min_comps=min_comps)
 
@@ -631,7 +700,11 @@ if analyze:
     c5.metric("Lot SqFt", number(subject_attrs.get("lot")))
     c6.metric("Year Built", subject_attrs.get("year") or "—")
     st.caption(f"Raw property type returned by data source: {subject_attrs.get('raw_type') or 'Unknown'}")
-    st.caption(f"Comp data pulled: {len(raw_comps)} total candidates ({record_count} property records + {avm_count} AVM comps).")
+    st.caption(f"Comp data pulled: {len(raw_comps)} usable AVM comp candidates ({record_count} property records checked for verification + {avm_count} AVM comps pulled).")
+    if 'rejected_count' in locals() and rejected_count:
+        st.warning(f"{rejected_count} stale/conflicting comp(s) were rejected because property-record sale history did not match the AVM sale date/price.")
+        with st.expander("Show rejected comps"):
+            st.dataframe(pd.DataFrame(rejected_comps), hide_index=True, use_container_width=True)
 
     arv, avg_psf, median_price = calculate_arv(comps, subject_attrs.get("sqft"), avm_data)
     st.subheader("ARV + Offer Matrix")
@@ -644,12 +717,13 @@ if analyze:
     tiers = [("75% ARV", 0.75), ("70% ARV", 0.70), ("65% ARV", 0.65), ("60% ARV", 0.60)]
     tier_cols = st.columns(4)
     for col, (label, pct) in zip(tier_cols, tiers):
-        offer = (arv * pct - repair_estimate) if arv else None
-        col.metric(label, money(offer))
-        col.caption(f"{label} - repairs")
+        gross_offer = (arv * pct) if arv else None
+        repair_adjusted = (gross_offer - repair_estimate) if gross_offer is not None else None
+        col.metric(label, money(gross_offer))
+        col.caption(f"Before repairs. After repairs: {money(repair_adjusted)}")
 
     st.subheader("Sold Comparable Sales")
-    st.caption("SOLD comps only. ARV uses verified AVM sale comps first. Property records are used for buyer/current-owner enrichment only unless a true sale-history event is available. Property type is matched first: condo/townhome vs single-family vs multifamily.")
+    st.caption("SOLD comps only. ARV and the comp table use AVM sale comps only. Property records are only used to verify/enrich matching AVM comps and reject stale/conflicting sale records.")
 
     if not comps:
         st.warning("No comps matched after filtering. The app did pull candidate records above; next step is to review/widen the criteria or inspect source fields.")
@@ -699,7 +773,7 @@ if analyze:
                 "Buyer": buyer,
                 "Investor?": "YES" if investor else "NO",
                 "Sale Source": c.get("_source", "RentCast"),
-                "Sale Verified?": "YES" if c.get("_verified_sale") else "HISTORY",
+                "Sale Verified?": "YES" if c.get("_verified_sale") else "NO",
                 "Redfin": links["Redfin"],
                 "Zillow": links["Zillow"],
                 "Map": links["Map"],
