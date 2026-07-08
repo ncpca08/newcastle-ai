@@ -1,6 +1,6 @@
 import math
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 
 import pandas as pd
@@ -18,9 +18,10 @@ def get_secret(name: str, default: str = "") -> str:
     except Exception:
         return default
 
-RENTCAST_API_KEY = get_secret("RENTCAST_API_KEY")
-DEALRUN_API_KEY = get_secret("DEALRUN_API_KEY")
 REALIE_API_KEY = get_secret("REALIE_API_KEY")
+RENTCAST_API_KEY = get_secret("RENTCAST_API_KEY")  # backup only
+
+REALIE_BASE = "https://app.realie.ai/api/public"
 
 # -------------------------
 # STYLE
@@ -37,6 +38,7 @@ st.markdown(
     .warn {color:#f59e0b;font-weight:700;}
     .bad {color:#ef4444;font-weight:700;}
     a {color:#93c5fd !important; text-decoration:none;}
+    .pill {display:inline-block;padding:4px 9px;border-radius:999px;background:#1f2937;border:1px solid #334155;margin-right:6px;margin-bottom:6px;font-size:12px;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -46,248 +48,81 @@ st.markdown(
 # HELPERS
 # -------------------------
 def money(value):
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+    if value is None or value == "" or (isinstance(value, float) and math.isnan(value)):
         return "—"
-    return f"${value:,.0f}"
+    try:
+        return f"${float(value):,.0f}"
+    except Exception:
+        return "—"
 
 
 def number(value):
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+    if value is None or value == "" or (isinstance(value, float) and math.isnan(value)):
         return "—"
     try:
         return f"{float(value):,.0f}"
     except Exception:
-        return str(value)
+        return "—"
+
+
+def normalize_address(address: str) -> str:
+    return re.sub(r"\s+", " ", (address or "").strip())
+
+
+def expand_street_suffix(address: str) -> str:
+    # Realie matched better when Ln became Lane on this test property.
+    replacements = {
+        r"\bLn\b": "Lane",
+        r"\bDr\b": "Drive",
+        r"\bSt\b": "Street",
+        r"\bAve\b": "Avenue",
+        r"\bRd\b": "Road",
+        r"\bBlvd\b": "Boulevard",
+        r"\bCt\b": "Court",
+        r"\bPl\b": "Place",
+        r"\bWay\b": "Way",
+    }
+    out = address
+    for pat, repl in replacements.items():
+        out = re.sub(pat, repl, out, flags=re.I)
+    return out
 
 
 def fmt_date(value):
-    if not value:
-        return "—"
-    try:
-        return pd.to_datetime(value).strftime("%m/%d/%Y")
-    except Exception:
-        return str(value)
+    dt = parse_date(value)
+    return dt.strftime("%m/%d/%Y") if dt else "—"
 
 
 def parse_date(value):
     if not value:
         return None
     try:
-        dt = pd.to_datetime(value, utc=True, errors="coerce")
+        if isinstance(value, (int, float)):
+            value = str(int(value))
+        s = str(value).strip()
+        if re.fullmatch(r"\d{8}", s):
+            return datetime.strptime(s, "%Y%m%d")
+        dt = pd.to_datetime(s, errors="coerce")
         if pd.isna(dt):
             return None
-        # Normalize to timezone-naive datetime so Streamlit/RentCast date formats compare safely.
-        return dt.tz_convert(None).to_pydatetime() if hasattr(dt, "tz_convert") else dt.to_pydatetime()
-    except Exception:
-        try:
-            return pd.to_datetime(value, errors="coerce").to_pydatetime()
-        except Exception:
-            return None
-
-
-def normalize_address(address: str) -> str:
-    return re.sub(r"\s+", " ", address.strip())
-
-
-def safe_float(value):
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
+        if getattr(dt, "tzinfo", None):
+            dt = dt.tz_convert(None) if hasattr(dt, "tz_convert") else dt.replace(tzinfo=None)
+        return dt.to_pydatetime() if hasattr(dt, "to_pydatetime") else dt
     except Exception:
         return None
 
 
 def haversine_miles(lat1, lon1, lat2, lon2):
-    lat1, lon1, lat2, lon2 = map(safe_float, [lat1, lon1, lat2, lon2])
-    if None in [lat1, lon1, lat2, lon2]:
+    try:
+        lat1, lon1, lat2, lon2 = map(float, [lat1, lon1, lat2, lon2])
+    except Exception:
         return None
     r = 3958.8
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
     return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-def owner_name(record):
-    if not isinstance(record, dict):
-        return None
-    owner = record.get("owner")
-    if isinstance(owner, dict):
-        names = owner.get("names") or []
-        if names:
-            return ", ".join([str(n) for n in names if n])
-        if owner.get("name"):
-            return owner.get("name")
-    return comp_field(record, "buyerName", "buyer", "ownerName", "currentOwnerName")
-
-
-def latest_sale(record):
-    """Legacy helper. Prefer verified_sale() for comp valuation."""
-    sale_date = comp_field(record, "soldDate", "lastSaleDate", "saleDate", "closeDate")
-    sale_price = comp_field(record, "soldPrice", "lastSalePrice", "salePrice", "price")
-    return sale_date, sale_price
-
-
-def history_sale(record):
-    """Find the newest true sale event from RentCast sale history.
-    This avoids treating tax/assessment/public-record update dates as sold comps.
-    """
-    history = record.get("history") if isinstance(record, dict) else None
-    if not isinstance(history, dict) or not history:
-        return None, None
-    sale_events = []
-    for key, event in history.items():
-        if not isinstance(event, dict):
-            continue
-        event_text = " ".join(str(event.get(k, "")) for k in ["event", "eventType", "type", "status"]).lower()
-        price = event.get("price") or event.get("salePrice") or event.get("soldPrice")
-        d = event.get("date") or key
-        dt = parse_date(d)
-        # Only trust actual sale/sold events with a real price.
-        if dt and price and ("sold" in event_text or "sale" in event_text or event_text == ""):
-            sale_events.append((dt, d, price))
-    if not sale_events:
-        return None, None
-    sale_events.sort(key=lambda x: x[0], reverse=True)
-    return sale_events[0][1], sale_events[0][2]
-
-
-def verified_sale(record):
-    """Return date/price for AVM sale comps only.
-
-    RentCast AVM comparable sale listings do not always use the field name
-    soldDate. Some responses use lastSeenDate/removedDate/daysOld with price.
-    Property records are still not allowed to become standalone comps.
-    """
-    if not isinstance(record, dict):
-        return None, None
-    if record.get("_verified_sale") is True:
-        price = comp_field(record, "soldPrice", "salePrice", "price", "lastSalePrice", "listPrice")
-        date = comp_field(record, "soldDate", "closeDate", "saleDate", "lastSaleDate", "lastSeenDate", "removedDate", "listingRemovedDate", "offMarketDate", "date")
-        if not date:
-            days_old = comp_field(record, "daysOld")
-            try:
-                if days_old is not None:
-                    date = (datetime.now() - timedelta(days=int(float(days_old)))).strftime("%Y-%m-%d")
-            except Exception:
-                pass
-        return date, price
-    return None, None
-
-def same_property_address(a, b):
-    def clean(x):
-        return re.sub(r"[^A-Z0-9]", "", str(x or "").upper())
-    return clean(a) and clean(a) == clean(b)
-
-
-def normalized_address_key(addr):
-    return re.sub(r"[^A-Z0-9]", "", str(addr or "").upper())
-
-
-def build_record_lookup(records):
-    lookup = {}
-    for rec in records or []:
-        addr = comp_field(rec, "formattedAddress", "address", "addressLine1")
-        key = normalized_address_key(addr)
-        if key:
-            lookup[key] = rec
-    return lookup
-
-
-
-
-def address_alias_key(addr):
-    """Normalize address for fuzzy unit matching, e.g. Unit 1, #1, Apt 1."""
-    x = str(addr or "").upper()
-    # Keep only the portion before city/state noise when possible
-    x = x.replace(" APARTMENT ", " UNIT ").replace(" APT ", " UNIT ").replace(" STE ", " UNIT ").replace(" SUITE ", " UNIT ")
-    x = re.sub(r"#\s*([A-Z0-9]+)", r" UNIT \1", x)
-    x = re.sub(r"\bUNIT\s*#?\s*", " UNIT ", x)
-    x = re.sub(r"\bDRIVE\b", "DR", x)
-    x = re.sub(r"\bLANE\b", "LN", x)
-    x = re.sub(r"\bAVENUE\b", "AVE", x)
-    x = re.sub(r"\bSTREET\b", "ST", x)
-    x = re.sub(r"[^A-Z0-9]+", " ", x).strip()
-    return re.sub(r"\s+", "", x)
-
-
-def loose_address_key(addr):
-    """A looser key that removes unit words but keeps the unit number."""
-    x = address_alias_key(addr)
-    return x.replace("UNIT", "")
-
-
-def matching_record_for_address(addr, records):
-    if not addr or not records:
-        return None
-    target_exact = normalized_address_key(addr)
-    target_alias = address_alias_key(addr)
-    target_loose = loose_address_key(addr)
-    best = None
-    for rec in records or []:
-        raddr = comp_field(rec, "formattedAddress", "address", "addressLine1")
-        keys = {normalized_address_key(raddr), address_alias_key(raddr), loose_address_key(raddr)}
-        if target_exact in keys or target_alias in keys or target_loose in keys:
-            return rec
-        # fallback: same street number and same unit number when available
-        ta = address_alias_key(addr)
-        ra = address_alias_key(raddr)
-        if ta and ra:
-            tnum = re.match(r"(\d+)", ta)
-            rnum = re.match(r"(\d+)", ra)
-            tunit = re.search(r"UNIT([A-Z0-9]+)", ta)
-            runit = re.search(r"UNIT([A-Z0-9]+)", ra)
-            if tnum and rnum and tnum.group(1) == rnum.group(1):
-                if tunit and runit and tunit.group(1) == runit.group(1):
-                    return rec
-                if not best:
-                    best = rec
-    return best
-
-def sale_dates_close(d1, d2, max_days=45):
-    dt1, dt2 = parse_date(d1), parse_date(d2)
-    if not dt1 or not dt2:
-        return False
-    return abs((dt1 - dt2).days) <= max_days
-
-
-def sale_prices_close(p1, p2, tolerance_pct=0.08):
-    p1, p2 = safe_float(p1), safe_float(p2)
-    if not p1 or not p2:
-        return False
-    return abs(p1 - p2) / max(p1, p2) <= tolerance_pct
-
-
-def reject_stale_or_conflicting_avm_comps(avm_comps, property_records):
-    """Keep AVM sale comps and use property records only for enrichment.
-
-    Earlier versions rejected AVM comps when property-record sale history disagreed,
-    but that removed valid AVM/listing comps in counties where public-record history
-    lags or differs from MLS/portal sale history. Now: AVM comps drive ARV/table;
-    property records only add buyer/current-owner, lot/photo fields when available.
-    """
-    lookup = build_record_lookup(property_records)
-    clean = []
-    rejected = []
-    for c in avm_comps or []:
-        addr = comp_field(c, "formattedAddress", "address", "addressLine1")
-        key = normalized_address_key(addr)
-        rec = lookup.get(key) or matching_record_for_address(addr, property_records)
-        if rec:
-            buyer = owner_name(rec)
-            if buyer:
-                c["buyerName"] = buyer
-                c["_buyer_enrichment_source"] = "RentCast Property Record"
-            for k in ["owner", "ownerName", "currentOwnerName", "lotSize", "lotSquareFootage", "photo", "imageUrl", "thumbnail"]:
-                if rec.get(k) not in [None, "", []] and c.get(k) in [None, "", []]:
-                    c[k] = rec.get(k)
-            for k in ["lotSize", "lotSquareFootage", "photo", "imageUrl", "thumbnail"]:
-                if c.get(k) in [None, "", []] and rec.get(k) not in [None, "", []]:
-                    c[k] = rec.get(k)
-        clean.append(c)
-    return clean, rejected
 
 
 def maps_links(address: str):
@@ -295,694 +130,368 @@ def maps_links(address: str):
     return {
         "Redfin": f"https://www.redfin.com/search#search_location={q}",
         "Zillow": f"https://www.zillow.com/homes/{q}_rb/",
-        "Map": f"https://www.google.com/maps/search/?api=1&query={q}",
-        "Street View": f"https://www.google.com/maps/@?api=1&map_action=pano&query={q}",
+        "Google Maps": f"https://www.google.com/maps/search/?api=1&query={q}",
+        "Street View": f"https://www.google.com/maps/search/?api=1&query={q}",
         "Satellite": f"https://www.google.com/maps/search/?api=1&query={q}&basemap=satellite",
     }
+
+
+def clean_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits if len(digits) == 10 else ""
+
+
+def call_link(phone: str):
+    digits = clean_phone(phone)
+    return f"tel:+1{digits}" if digits else ""
+
+
+def sms_link(phone: str, body: str = ""):
+    digits = clean_phone(phone)
+    if not digits:
+        return ""
+    if body:
+        return f"sms:+1{digits}&body={quote_plus(body)}"
+    return f"sms:+1{digits}"
 
 
 def is_likely_investor(name: str) -> bool:
     if not name:
         return False
-    keywords = [
-        "LLC", "INC", "CORP", "TRUST", "HOLDINGS", "INVEST", "CAPITAL",
-        "PROPERTIES", "HOMES", "REALTY", "PARTNERS", "LP", "L.P.", "GROUP"
-    ]
-    upper = str(name).upper()
+    keywords = ["LLC", "INC", "CORP", "TRUST", "HOLDINGS", "INVEST", "CAPITAL", "PROPERTIES", "HOMES", "REALTY", "PARTNERS", "LP", "L.P."]
+    upper = name.upper()
     return any(k in upper for k in keywords)
 
 
-def comp_field(comp, *keys):
-    for key in keys:
-        if isinstance(comp, dict) and comp.get(key) is not None:
-            return comp.get(key)
-    return None
-
-# -------------------------
-# PROPERTY TYPE LOGIC
-# -------------------------
-def raw_property_type(record: dict) -> str:
-    if not isinstance(record, dict):
-        return ""
-    fields = [
-        "propertyType", "propertySubType", "propertyUse", "type", "buildingType",
-        "formattedPropertyType", "category", "zoningDescription"
-    ]
-    values = [str(record.get(f, "")) for f in fields if record.get(f)]
-    return " ".join(values).strip()
-
-
-def property_family(record: dict) -> str:
-    """Normalize property types so comps are compared apples-to-apples."""
-    raw = raw_property_type(record).upper()
-    units = comp_field(record, "units", "unitCount", "numberOfUnits", "totalUnits")
-
-    if any(x in raw for x in ["CONDO", "CONDOMINIUM"]):
-        return "Condo"
-    if any(x in raw for x in ["TOWNHOUSE", "TOWNHOME", "PUD"]):
-        return "Townhome"
-    if any(x in raw for x in ["DUPLEX", "TRIPLEX", "FOURPLEX", "QUAD", "MULTI", "APARTMENT", "2-4", "MULTIFAMILY"]):
-        return "Multifamily"
-    try:
-        if units and float(units) >= 2:
-            return "Multifamily"
-    except Exception:
-        pass
-    if any(x in raw for x in ["SINGLE", "SFR", "DETACHED", "RESIDENTIAL"]):
-        return "Single Family"
-    return "Unknown"
-
-
-def type_matches(subject_family: str, comp_family: str, strict=True) -> bool:
-    if not subject_family or subject_family == "Unknown" or not comp_family or comp_family == "Unknown":
-        return not strict
-    if subject_family in ["Condo", "Townhome"]:
-        return comp_family in ["Condo", "Townhome"]
-    return subject_family == comp_family
-
-# -------------------------
-# API CLIENTS
-# -------------------------
-def rentcast_headers():
-    return {"X-Api-Key": RENTCAST_API_KEY, "Accept": "application/json"}
-
-
-def get_property_record(address: str):
-    if not RENTCAST_API_KEY:
-        return None, "Missing RentCast API key. Add it in Streamlit secrets."
-    url = "https://api.rentcast.io/v1/properties"
-    params = {"address": address}
-    r = requests.get(url, headers=rentcast_headers(), params=params, timeout=30)
-    if r.status_code != 200:
-        return None, f"RentCast property lookup failed: {r.status_code} {r.text[:300]}"
-    data = r.json()
-    if isinstance(data, list) and data:
-        return data[0], None
-    if isinstance(data, dict) and data:
-        return data, None
-    return None, "No subject property found."
-
-
-def get_value_and_comps(address: str, radius: float = 1.0):
-    if not RENTCAST_API_KEY:
-        return None, "Missing RentCast API key. Add it in Streamlit secrets."
-    url = "https://api.rentcast.io/v1/avm/value"
-    params = {"address": address, "maxRadius": radius, "lookupSubjectAttributes": "true"}
-    r = requests.get(url, headers=rentcast_headers(), params=params, timeout=30)
-    if r.status_code != 200:
-        return None, f"RentCast AVM lookup failed: {r.status_code} {r.text[:300]}"
-    return r.json(), None
-
-def rentcast_property_type_values(subject_family: str):
-    if subject_family == "Condo":
-        return ["Condo", "Townhouse"]
-    if subject_family == "Townhome":
-        return ["Townhouse", "Condo"]
-    if subject_family == "Single Family":
-        return ["Single Family"]
-    if subject_family == "Multifamily":
-        return ["Multi-Family", "Apartment"]
-    if subject_family == "Manufactured":
-        return ["Manufactured"]
-    return []
-
-
-def get_sold_property_records(address: str, subject_attrs: dict, radius: float = 1.0, days: int = 365, sqft_tolerance: int = 700, strict_type: bool = True, strict_beds: bool = False, strict_baths: bool = False):
-    """Pull nearby SOLD property records from RentCast /v1/properties.
-    This is separate from the AVM endpoint and is what powers the detailed comp table.
-    """
-    if not RENTCAST_API_KEY:
-        return [], "Missing RentCast API key. Add it in Streamlit secrets."
-
-    subject_family = subject_attrs.get("family", "Unknown")
-    ssqft = safe_float(subject_attrs.get("sqft"))
-    sbeds = subject_attrs.get("beds")
-    sbaths = subject_attrs.get("baths")
-    query_types = rentcast_property_type_values(subject_family) if strict_type else [None]
-    if not query_types:
-        query_types = [None]
-
-    all_records = []
-    errors = []
-    url = "https://api.rentcast.io/v1/properties"
-
-    for property_type in query_types:
-        params = {
-            "address": address,
-            "radius": radius,
-            "saleDateRange": str(days),
-            "limit": 500,
-        }
-        if property_type:
-            params["propertyType"] = property_type
-        if strict_beds and sbeds is not None:
-            params["bedrooms"] = str(int(round(float(sbeds))))
-        if strict_baths and sbaths is not None:
-            params["bathrooms"] = str(float(sbaths)).rstrip('0').rstrip('.')
-        if ssqft and sqft_tolerance:
-            params["squareFootage"] = f"{max(0, int(ssqft - sqft_tolerance))}-{int(ssqft + sqft_tolerance)}"
-
-        try:
-            r = requests.get(url, headers=rentcast_headers(), params=params, timeout=30)
-            if r.status_code != 200:
-                errors.append(f"Property records comp search failed: {r.status_code} {r.text[:180]}")
-                continue
-            data = r.json()
-            if isinstance(data, list):
-                all_records.extend(data)
-            elif isinstance(data, dict) and isinstance(data.get("data"), list):
-                all_records.extend(data.get("data"))
-        except Exception as e:
-            errors.append(f"Property records comp search error: {e}")
-
-    # Deduplicate by RentCast id or address
-    unique = {}
-    for rec in all_records:
-        key = rec.get("id") or rec.get("formattedAddress") or str(rec)
-        unique[key] = rec
-    return list(unique.values()), "; ".join(errors) if errors else None
-
-
-def normalize_comp_record(record, subject_attrs=None, source="RentCast", verified_sale_comp=False):
-    c = dict(record or {})
-    c["_source"] = source
-    c["_verified_sale"] = bool(verified_sale_comp)
-
-    # Only stamp soldDate/soldPrice when this is a verified sale comp.
-    # For property records, keep buyer/current owner enrichment but do NOT let
-    # unverified record prices drive the ARV.
-    sale_date, sale_price = verified_sale(c)
-    if sale_date is not None:
-        c["soldDate"] = sale_date
-    if sale_price is not None:
-        c["soldPrice"] = sale_price
-        if verified_sale_comp:
-            c["_verified_sale"] = True
-
-    buyer = owner_name(c)
-    if buyer:
-        c["buyerName"] = buyer
-
-    if subject_attrs:
-        dist = comp_field(c, "distance", "distanceMiles")
-        if dist is None:
-            dist = haversine_miles(subject_attrs.get("lat"), subject_attrs.get("lon"), c.get("latitude"), c.get("longitude"))
-        if dist is not None:
-            c["distance"] = dist
-    return c
-
-def merge_comps(*lists):
-    """Merge comps by address, preserving verified AVM sale date/price.
-
-    Property records are valuable for buyer/current-owner enrichment, but they can
-    carry stale or non-MLS sale data. If a record is not a verified sale comp, it
-    can enrich buyer/owner/lot/photo fields but cannot overwrite verified sale date
-    or sale price.
-    """
-    merged = {}
-    for items in lists:
-        for item in items or []:
-            addr = item.get("formattedAddress") or item.get("address") or item.get("addressLine1") or str(item)
-            key = re.sub(r"[^A-Z0-9]", "", str(addr).upper())
-            if key not in merged:
-                # Do not allow property records/history records to become standalone comps.
-                # They are only allowed to enrich a verified AVM sale comp with the same address.
-                if item.get("_verified_sale") is True:
-                    merged[key] = item
-                continue
-
-            existing = dict(merged[key])
-            item_verified = item.get("_verified_sale") is True
-            existing_verified = existing.get("_verified_sale") is True
-
-            if item_verified and not existing_verified:
-                combined = dict(item)
-                # Bring over owner/buyer enrichment from the property record if available.
-                for k in ["buyerName", "owner", "ownerName", "currentOwnerName", "photo", "imageUrl", "thumbnail", "lotSize", "lotSquareFootage"]:
-                    if existing.get(k) not in [None, "", []] and combined.get(k) in [None, "", []]:
-                        combined[k] = existing.get(k)
-                merged[key] = combined
-            elif existing_verified and not item_verified:
-                # Preserve verified sale values; only enrich missing non-sale fields.
-                for k in ["buyerName", "owner", "ownerName", "currentOwnerName", "photo", "imageUrl", "thumbnail", "lotSize", "lotSquareFootage"]:
-                    if item.get(k) not in [None, "", []] and existing.get(k) in [None, "", []]:
-                        existing[k] = item.get(k)
-                merged[key] = existing
-            else:
-                # Same trust level: fill blanks only, don't overwrite populated fields.
-                for k, v in item.items():
-                    if existing.get(k) in [None, "", []] and v not in [None, "", []]:
-                        existing[k] = v
-                merged[key] = existing
-    return list(merged.values())
-
-
-
-
-# -------------------------
-# REALIE API TESTER
-# -------------------------
 def realie_headers():
-    # Realie docs say to provide the API key directly in the Authorization header.
     return {"Authorization": REALIE_API_KEY, "Accept": "application/json"}
 
 
-def realie_address_lookup(state: str, street_address: str, unit: str = "", city: str = "", county: str = ""):
+def realie_get(path: str, params: dict):
     if not REALIE_API_KEY:
-        return {"ok": False, "error": "Missing REALIE_API_KEY in Streamlit secrets."}
-    url = "https://app.realie.ai/api/public/property/address/"
-    params = {"state": state.strip().upper(), "address": street_address.strip()}
-    if unit.strip():
-        params["unitNumberStripped"] = unit.strip().replace("#", "").replace("UNIT", "").replace("APT", "").strip()
-    if city.strip():
-        params["city"] = city.strip()
-    if county.strip():
-        params["county"] = county.strip()
+        return None, "Missing REALIE_API_KEY in Streamlit Secrets."
+    url = f"{REALIE_BASE}{path}"
+    r = requests.get(url, headers=realie_headers(), params=params, timeout=45)
+    if r.status_code != 200:
+        return None, f"Realie API error {r.status_code}: {r.text[:500]}"
     try:
-        r = requests.get(url, headers=realie_headers(), params=params, timeout=30)
-        try:
-            body = r.json()
-        except Exception:
-            body = None
-        return {
-            "ok": 200 <= r.status_code < 300,
-            "status_code": r.status_code,
-            "url_tested": url,
-            "params": params,
-            "content_type": r.headers.get("content-type", ""),
-            "body_preview": (r.text or "")[:4000],
-            "json": body if isinstance(body, (dict, list)) else None,
-        }
-    except Exception as e:
-        return {"ok": False, "url_tested": url, "params": params, "error": str(e)}
+        return r.json(), None
+    except Exception:
+        return None, f"Realie returned non-JSON response: {r.text[:500]}"
 
 
+def parse_input_address(full_address: str):
+    """Small parser for normal US address input. User can override in sidebar if needed."""
+    s = normalize_address(full_address)
+    unit = ""
+    # Extract #1, Unit 1, Apt 1, Ste 1
+    m = re.search(r"(?:#|\bunit\b|\bapt\b|\bapartment\b|\bste\b|\bsuite\b)\s*([A-Za-z0-9-]+)", s, flags=re.I)
+    if m:
+        unit = m.group(1).strip()
+        s = (s[:m.start()] + s[m.end():]).strip(" ,")
+    parts = [p.strip() for p in s.split(",")]
+    street = parts[0] if parts else s
+    city = parts[1] if len(parts) > 1 else ""
+    state = ""
+    zip_code = ""
+    if len(parts) > 2:
+        m2 = re.search(r"\b([A-Z]{2})\b\s*(\d{5})?", parts[2].upper())
+        if m2:
+            state = m2.group(1)
+            zip_code = m2.group(2) or ""
+    return {"street": street, "unit": unit, "city": city, "state": state, "zip": zip_code}
 
-def realie_property_search(state: str, street_address: str, unit: str = "", city: str = "", county: str = "", residential: bool = True, limit: int = 10):
-    if not REALIE_API_KEY:
-        return {"ok": False, "error": "Missing REALIE_API_KEY in Streamlit secrets."}
-    url = "https://app.realie.ai/api/public/property/search/"
+
+def realie_property_search(state, address, county="", city="", unit="", limit=10):
+    # Try both original and expanded street suffix. Unit sometimes prevents matching, so try without unit too.
+    attempts = []
+    for addr in [address, expand_street_suffix(address)]:
+        if not addr:
+            continue
+        base = {"state": state, "address": addr, "residential": "true", "limit": limit}
+        if county:
+            base["county"] = county
+        if city:
+            base["city"] = city
+        if unit:
+            with_unit = dict(base)
+            with_unit["unitNumberStripped"] = unit
+            attempts.append(with_unit)
+        attempts.append(base)
+
+    last_error = None
+    for params in attempts:
+        data, err = realie_get("/property/search/", params)
+        if err:
+            last_error = err
+            continue
+        props = (data or {}).get("properties") or []
+        if props:
+            return props, params, None
+        last_error = "No properties found."
+    return [], attempts[-1] if attempts else {}, last_error
+
+
+def subject_property_type(prop: dict):
+    if not prop:
+        return "unknown", "any"
+    if prop.get("condo") is True:
+        return "Condo", "condo"
+    # Realie premium docs accept any/condo/house. Treat residential non-condo as house.
+    if prop.get("residential") is True:
+        return "House / SFR", "house"
+    return "Unknown", "any"
+
+
+def choose_subject_property(properties, requested_unit=""):
+    if not properties:
+        return None
+    if requested_unit:
+        unit_clean = str(requested_unit).strip().lower()
+        for p in properties:
+            if str(p.get("unitNumberStripped", "")).strip().lower() == unit_clean:
+                return p
+            if f"unit {unit_clean}" in str(p.get("legalDesc", "")).lower():
+                return p
+    # Prefer record with modelValue and coordinates.
+    scored = []
+    for p in properties:
+        score = 0
+        if p.get("modelValue"):
+            score += 10
+        if p.get("latitude") and p.get("longitude"):
+            score += 5
+        if p.get("transferPrice"):
+            score += 2
+        scored.append((score, p))
+    return sorted(scored, key=lambda x: x[0], reverse=True)[0][1]
+
+
+def get_sale_price_date(comp):
+    """Pick a verified-looking non-zero transfer/sale pair from Realie."""
+    candidates = []
+    # Prefer explicit top-level transfer price/date.
+    for price_key, date_key in [("transferPrice", "transferDate"), ("salePriceLastTransfer", "transferDate"), ("pastPriceTransfer", "pastSaleDateTransfer"), ("pastPriceSale", "priorSalesDate")]:
+        price = comp.get(price_key)
+        date = comp.get(date_key)
+        if price and float(price or 0) > 0 and date:
+            candidates.append((parse_date(date), float(price), price_key, date_key))
+    # Also inspect transfers array.
+    for t in comp.get("transfers") or []:
+        price = t.get("transferPrice")
+        date = t.get("transferDate") or t.get("transferDateObject")
+        doc = str(t.get("transferDocType") or "").upper()
+        if price and float(price or 0) > 0 and date:
+            bonus = 1 if doc == "GD" else 0
+            candidates.append((parse_date(date), float(price), f"transfer:{doc}", "transfers"))
+    candidates = [c for c in candidates if c[0] is not None]
+    if not candidates:
+        return None, None, ""
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    dt, price, source, _ = candidates[0]
+    return price, dt, source
+
+
+def realie_premium_comps(lat, lon, subject, radius, months, property_type, sqft_tolerance=300, exact_beds=True, exact_baths=True):
+    sqft = subject.get("livingArea") or subject.get("buildingArea")
+    beds = subject.get("totalBedrooms")
+    baths = subject.get("totalBathrooms")
     params = {
-        "state": state.strip().upper(),
-        "address": street_address.strip(),
-        "residential": str(bool(residential)).lower(),
-        "limit": int(limit),
-    }
-    if unit.strip():
-        params["unitNumberStripped"] = unit.strip().replace("#", "").replace("UNIT", "").replace("APT", "").strip()
-    if city.strip():
-        params["city"] = city.strip()
-    if county.strip():
-        params["county"] = county.strip()
-    try:
-        r = requests.get(url, headers=realie_headers(), params=params, timeout=30)
-        try:
-            body = r.json()
-        except Exception:
-            body = None
-        return {
-            "ok": 200 <= r.status_code < 300,
-            "status_code": r.status_code,
-            "url_tested": url,
-            "params": params,
-            "content_type": r.headers.get("content-type", ""),
-            "body_preview": (r.text or "")[:8000],
-            "json": body if isinstance(body, (dict, list)) else None,
-        }
-    except Exception as e:
-        return {"ok": False, "url_tested": url, "params": params, "error": str(e)}
-
-
-def deep_find_first(obj, keys):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if str(k).lower() in [x.lower() for x in keys] and v not in [None, "", []]:
-                return v
-        for v in obj.values():
-            found = deep_find_first(v, keys)
-            if found not in [None, "", []]:
-                return found
-    elif isinstance(obj, list):
-        for item in obj:
-            found = deep_find_first(item, keys)
-            if found not in [None, "", []]:
-                return found
-    return None
-
-
-def extract_first_property(result):
-    body = result.get("json") if isinstance(result, dict) else None
-    if isinstance(body, dict):
-        props = body.get("properties") or body.get("results") or body.get("data")
-        if isinstance(props, list) and props:
-            return props[0]
-        if isinstance(props, dict):
-            return props
-    return None
-
-
-def extract_lat_lon_from_property(prop):
-    lat = deep_find_first(prop, ["latitude", "lat"])
-    lon = deep_find_first(prop, ["longitude", "lon", "lng"])
-    return lat, lon
-
-def realie_comparables_search(latitude, longitude, radius=0.5, months=6, max_results=25, sqft_min=None, sqft_max=None, beds=None, baths=None, property_type="any"):
-    if not REALIE_API_KEY:
-        return {"ok": False, "error": "Missing REALIE_API_KEY in Streamlit secrets."}
-    url = "https://app.realie.ai/api/public/premium/comparables/"
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
+        "latitude": str(lat),
+        "longitude": str(lon),
         "radius": radius,
         "timeFrame": months,
-        "maxResults": max_results,
+        "maxResults": 50,
         "propertyType": property_type,
     }
-    if sqft_min not in [None, ""]: params["sqftMin"] = int(float(sqft_min))
-    if sqft_max not in [None, ""]: params["sqftMax"] = int(float(sqft_max))
-    if beds not in [None, ""]:
-        params["bedsMin"] = int(float(beds)); params["bedsMax"] = int(float(beds))
-    if baths not in [None, ""]:
-        params["bathsMin"] = float(baths); params["bathsMax"] = float(baths)
-    try:
-        r = requests.get(url, headers=realie_headers(), params=params, timeout=30)
-        try:
-            body = r.json()
-        except Exception:
-            body = None
-        return {
-            "ok": 200 <= r.status_code < 300,
-            "status_code": r.status_code,
-            "url_tested": url,
-            "params": params,
-            "content_type": r.headers.get("content-type", ""),
-            "body_preview": (r.text or "")[:4000],
-            "json": body if isinstance(body, (dict, list)) else None,
-        }
-    except Exception as e:
-        return {"ok": False, "url_tested": url, "params": params, "error": str(e)}
+    if sqft:
+        params["sqftMin"] = max(0, int(float(sqft) - sqft_tolerance))
+        params["sqftMax"] = int(float(sqft) + sqft_tolerance)
+    if exact_beds and beds is not None:
+        params["bedsMin"] = int(float(beds))
+        params["bedsMax"] = int(float(beds))
+    if exact_baths and baths is not None:
+        params["bathsMin"] = int(float(baths))
+        params["bathsMax"] = int(float(baths))
+
+    data, err = realie_get("/premium/comparables/", params)
+    if err:
+        # 404 No comparable properties found is not fatal.
+        if "No comparable" in err or "404" in err:
+            return [], params, None
+        return [], params, err
+    return (data or {}).get("comparables") or [], params, None
 
 
-# -------------------------
-# DEALRUN API TESTER (temporary discovery tool)
-# -------------------------
-def dealrun_request(base_url: str, path: str, method: str = "GET", auth_mode: str = "Bearer", address: str = ""):
-    """Small safe tester to discover DealRun API behavior without exposing the key."""
-    if not DEALRUN_API_KEY:
-        return {"ok": False, "error": "Missing DEALRUN_API_KEY in Streamlit secrets."}
-
-    base_url = (base_url or "").strip().rstrip("/")
-    path = (path or "").strip()
-    if not path.startswith("/"):
-        path = "/" + path
-    url = base_url + path
-
-    headers = {"Accept": "application/json"}
-    params = {}
-    json_body = None
-
-    if auth_mode == "Bearer token":
-        headers["Authorization"] = f"Bearer {DEALRUN_API_KEY}"
-    elif auth_mode == "X-API-Key":
-        headers["X-API-Key"] = DEALRUN_API_KEY
-    elif auth_mode == "api_key query":
-        params["api_key"] = DEALRUN_API_KEY
-    elif auth_mode == "Token header":
-        headers["Authorization"] = f"Token {DEALRUN_API_KEY}"
-
-    if address:
-        # Try common address parameter names for GET. For POST, send JSON body.
-        if method == "GET":
-            params["address"] = address
-        else:
-            headers["Content-Type"] = "application/json"
-            json_body = {"address": address}
-
-    try:
-        if method == "GET":
-            r = requests.get(url, headers=headers, params=params, timeout=20)
-        else:
-            r = requests.post(url, headers=headers, params=params, json=json_body, timeout=20)
-
-        body_text = r.text or ""
-        body_preview = body_text[:3000]
-        try:
-            parsed = r.json()
-        except Exception:
-            parsed = None
-
-        return {
-            "ok": 200 <= r.status_code < 300,
-            "status_code": r.status_code,
-            "url_tested": url,
-            "auth_mode": auth_mode,
-            "method": method,
-            "content_type": r.headers.get("content-type", ""),
-            "body_preview": body_preview,
-            "json": parsed if isinstance(parsed, (dict, list)) else None,
-        }
-    except Exception as e:
-        return {"ok": False, "url_tested": url, "auth_mode": auth_mode, "method": method, "error": str(e)}
-
-
-
-# -------------------------
-# SAMPLE DATA FOR PREVIEW
-# -------------------------
-def sample_result():
-    subject = {
-        "formattedAddress": "1342 Branham Ln #1, San Jose, CA 95118",
-        "bedrooms": 2, "bathrooms": 1, "squareFootage": 810, "lotSize": 436, "yearBuilt": 1970,
-        "propertyType": "Condominium", "owner": {"names": ["Sample Owner"]},
-    }
-    comps = [
-        {"formattedAddress":"1350 Branham Ln #4, San Jose, CA 95118","soldDate":"2026-06-18","soldPrice":486000,"bedrooms":2,"bathrooms":1,"squareFootage":825,"lotSize":436,"distance":0.08,"buyerName":"Silicon Valley Homes LLC","propertyType":"Condominium","photo":"https://placehold.co/160x100?text=Condo+Comp"},
-        {"formattedAddress":"1328 Branham Ln #7, San Jose, CA 95118","soldDate":"2026-05-30","soldPrice":475000,"bedrooms":2,"bathrooms":1,"squareFootage":800,"lotSize":436,"distance":0.13,"buyerName":"Jane Doe","propertyType":"Condominium","photo":"https://placehold.co/160x100?text=Condo+Comp"},
-        {"formattedAddress":"1400 Branham Ln #2, San Jose, CA 95118","soldDate":"2026-04-22","soldPrice":492000,"bedrooms":2,"bathrooms":1,"squareFootage":850,"lotSize":436,"distance":0.31,"buyerName":"Bay Area Property Group LLC","propertyType":"Townhome","photo":"https://placehold.co/160x100?text=Townhome+Comp"},
-    ]
-    return subject, {"comparables": comps, "price": 475458}, None
-
-# -------------------------
-# COMP FILTERING
-# -------------------------
-def extract_comps(avm_data):
-    if not avm_data:
-        return []
-    for key in ["comparables", "saleComparables", "comps", "listings"]:
-        value = avm_data.get(key) if isinstance(avm_data, dict) else None
-        if isinstance(value, list):
-            return value
-    return []
-
-
-def get_subject_attrs(subject, avm_data):
-    merged = {}
-    if isinstance(avm_data, dict):
-        merged.update(avm_data.get("subjectProperty", {}) or {})
-    if isinstance(subject, dict):
-        merged.update(subject)
-    owner = None
-    if isinstance(merged.get("owner"), dict):
-        owner = ((merged.get("owner") or {}).get("names") or [None])[0]
-    return {
-        "beds": merged.get("bedrooms") or merged.get("beds"),
-        "baths": merged.get("bathrooms") or merged.get("baths"),
-        "sqft": merged.get("squareFootage") or merged.get("sqft") or merged.get("livingArea"),
-        "lot": merged.get("lotSize") or merged.get("lotSquareFootage"),
-        "year": merged.get("yearBuilt"),
-        "address": merged.get("formattedAddress") or merged.get("addressLine1") or merged.get("address"),
-        "owner": owner,
-        "family": property_family(merged),
-        "raw_type": raw_property_type(merged) or "Unknown",
-        "lat": merged.get("latitude"),
-        "lon": merged.get("longitude"),
-    }
-
-
-def filter_comps(raw_comps, subject_attrs, months=6, radius=0.5, sqft_tolerance=300, strict_type=True, strict_beds=True, strict_baths=True):
+def validate_and_score_comps(raw_comps, subject, property_type_label, max_months, max_radius, sqft_tolerance=300):
     now = datetime.now()
-    cutoff = now - timedelta(days=months * 30)
-    sbeds, sbaths, ssqft = subject_attrs.get("beds"), subject_attrs.get("baths"), subject_attrs.get("sqft")
-    subject_family = subject_attrs.get("family", "Unknown")
-    filtered = []
-    for c in raw_comps:
-        raw_sale_date, raw_sold_price = verified_sale(c)
-        sale_date = parse_date(raw_sale_date)
-        sold_price = raw_sold_price
-        beds = comp_field(c, "bedrooms", "beds")
-        baths = comp_field(c, "bathrooms", "baths")
-        sqft = comp_field(c, "squareFootage", "sqft", "livingArea")
-        dist = comp_field(c, "distance", "distanceMiles")
-        status = str(comp_field(c, "status", "listingStatus") or "sold").lower()
-        comp_family = property_family(c)
-        comp_addr = comp_field(c, "formattedAddress", "address", "addressLine1")
-        if same_property_address(comp_addr, subject_attrs.get("address")):
-            continue
+    cutoff = now - timedelta(days=max_months * 30)
+    s_lat, s_lon = subject.get("latitude"), subject.get("longitude")
+    s_sqft = subject.get("livingArea") or subject.get("buildingArea")
+    s_beds = subject.get("totalBedrooms")
+    s_baths = subject.get("totalBathrooms")
+    s_year = subject.get("yearBuilt")
+    s_sub = str(subject.get("subdivision") or "").upper()
+    s_parcel = subject.get("parcelId")
 
-        if not sale_date or not sold_price:
+    cleaned = []
+    seen = set()
+    for c in raw_comps:
+        price, sale_date, source = get_sale_price_date(c)
+        if not price or not sale_date:
             continue
         if sale_date < cutoff:
             continue
-        if "active" in status or "pending" in status:
+        if c.get("parcelId") == s_parcel:
             continue
-        if dist is not None and float(dist) > radius:
+        c_sqft = c.get("livingArea") or c.get("buildingArea")
+        if s_sqft and c_sqft and abs(float(c_sqft) - float(s_sqft)) > sqft_tolerance:
             continue
-        if strict_type and not type_matches(subject_family, comp_family, strict=True):
+        if s_beds is not None and c.get("totalBedrooms") is not None and int(float(c.get("totalBedrooms"))) != int(float(s_beds)):
             continue
-        if strict_beds and sbeds is not None and beds is not None and int(round(float(beds))) != int(round(float(sbeds))):
+        if s_baths is not None and c.get("totalBathrooms") is not None and float(c.get("totalBathrooms")) != float(s_baths):
             continue
-        if strict_baths and sbaths is not None and baths is not None and float(baths) != float(sbaths):
+        if property_type_label == "Condo" and c.get("condo") is not True:
             continue
-        if ssqft is not None and sqft is not None and abs(float(sqft) - float(ssqft)) > sqft_tolerance:
+        if property_type_label != "Condo" and property_type_label != "Unknown" and c.get("condo") is True:
             continue
+        dist = haversine_miles(s_lat, s_lon, c.get("latitude"), c.get("longitude"))
+        if dist is not None and dist > max_radius:
+            continue
+        key = (c.get("parcelId"), int(price), sale_date.strftime("%Y%m%d"))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        score = 0
+        # Same property type
+        score += 30
+        # Same subdivision / complex
+        if s_sub and str(c.get("subdivision") or "").upper() == s_sub:
+            score += 25
+        # Distance
+        if dist is not None:
+            score += max(0, 20 - (dist / max(max_radius, 0.01) * 20))
+        # Sqft similarity
+        if s_sqft and c_sqft:
+            diff = abs(float(c_sqft) - float(s_sqft))
+            score += max(0, 20 - (diff / sqft_tolerance * 20))
+        # Recency
+        days_old = (now - sale_date).days
+        score += max(0, 20 - (days_old / max(max_months * 30, 1) * 20))
+        # Year built
+        if s_year and c.get("yearBuilt"):
+            score += max(0, 10 - (abs(float(c.get("yearBuilt")) - float(s_year)) / 20 * 10))
+        # Exact bed/bath already filtered; reward
+        score += 20
+
         c2 = dict(c)
+        c2["_sale_price"] = price
         c2["_sale_date"] = sale_date
-        c2["_sold_price"] = float(sold_price)
-        c2["_sqft"] = float(sqft) if sqft else None
-        c2["_family"] = comp_family
-        c2["soldDate"] = raw_sale_date
-        c2["soldPrice"] = sold_price
-        c2["buyerName"] = owner_name(c2) or comp_field(c2, "buyerName", "buyer", "ownerName", "owner")
-        c2["_source"] = c2.get("_source") or "RentCast"
-        filtered.append(c2)
-    filtered.sort(key=lambda x: x["_sale_date"], reverse=True)
-    return filtered
+        c2["_sale_source"] = source
+        c2["_distance"] = dist
+        c2["_score"] = round(score, 1)
+        c2["_price_per_sqft"] = price / float(c_sqft) if c_sqft else None
+        cleaned.append(c2)
+
+    cleaned.sort(key=lambda x: (x["_score"], x["_sale_date"]), reverse=True)
+    return cleaned
 
 
-def find_best_comps(raw_comps, subject_attrs, min_comps=3):
-    passes = [
-        {"label":"Ideal: 6 mo / 0.50 mi / same type / same bed-bath / ±300 sqft", "months":6, "radius":0.5, "sqft_tolerance":300, "strict_type":True, "strict_beds":True, "strict_baths":True},
-        {"label":"Expanded: 6 mo / 0.75 mi / same type / same bed-bath / ±400 sqft", "months":6, "radius":0.75, "sqft_tolerance":400, "strict_type":True, "strict_beds":True, "strict_baths":True},
-        {"label":"Fallback: 12 mo / 1.00 mi / same type / same bed-bath / ±500 sqft", "months":12, "radius":1.0, "sqft_tolerance":500, "strict_type":True, "strict_beds":True, "strict_baths":True},
-        {"label":"Closest same property type: 12 mo / 1.00 mi / flexible bed-bath / ±600 sqft", "months":12, "radius":1.0, "sqft_tolerance":600, "strict_type":True, "strict_beds":False, "strict_baths":False},
-        {"label":"Closest available: 12 mo / 1.00 mi / type may be unknown", "months":12, "radius":1.0, "sqft_tolerance":700, "strict_type":False, "strict_beds":False, "strict_baths":False},
+def progressive_comp_search(subject, property_type_api, property_type_label, min_comps):
+    lat, lon = subject.get("latitude"), subject.get("longitude")
+    if not lat or not lon:
+        return [], [], "Missing subject latitude/longitude."
+
+    # Starts strict: same type, 0.5 miles, 6 months, ±300 sqft, exact beds/baths.
+    rounds = [
+        {"radius": 0.5, "months": 6, "sqft_tol": 300, "label": "Strict: 0.5 mi / 6 months / ±300 sqft"},
+        {"radius": 0.5, "months": 12, "sqft_tol": 300, "label": "Fallback: 0.5 mi / 12 months / ±300 sqft"},
+        {"radius": 1.0, "months": 12, "sqft_tol": 300, "label": "Fallback: 1.0 mi / 12 months / ±300 sqft"},
+        {"radius": 1.0, "months": 18, "sqft_tol": 300, "label": "Fallback: 1.0 mi / 18 months / ±300 sqft"},
     ]
-    for rule in passes:
-        comps = filter_comps(raw_comps, subject_attrs, **{k:v for k,v in rule.items() if k != "label"})
-        if len(comps) >= min_comps:
-            return comps, rule["label"]
-    last_rule = passes[-1]
-    return filter_comps(raw_comps, subject_attrs, **{k:v for k,v in last_rule.items() if k != "label"}), last_rule["label"]
+    diagnostics = []
+    best = []
+    for rule in rounds:
+        raw, params, err = realie_premium_comps(
+            lat, lon, subject,
+            radius=rule["radius"],
+            months=rule["months"],
+            property_type=property_type_api,
+            sqft_tolerance=rule["sqft_tol"],
+            exact_beds=True,
+            exact_baths=True,
+        )
+        valid = validate_and_score_comps(raw, subject, property_type_label, rule["months"], rule["radius"], rule["sqft_tol"])
+        diagnostics.append({"round": rule["label"], "raw_returned": len(raw), "valid_after_filter": len(valid), "params": params, "error": err})
+        if len(valid) > len(best):
+            best = valid
+        if len(valid) >= min_comps:
+            return valid, diagnostics, None
+    return best, diagnostics, None
 
 
-def calculate_arv(comps, subject_sqft, avm_data=None):
-    if isinstance(avm_data, dict):
-        for key in ["price", "value", "valuation", "estimatedValue"]:
-            if avm_data.get(key):
-                # Still prefer comps if we have them, but use AVM as fallback.
-                avm_value = float(avm_data.get(key))
-                break
-        else:
-            avm_value = None
-    else:
-        avm_value = None
+def weighted_arv(comps, subject_sqft, top_n=5):
     if not comps:
-        return avm_value, None, None
-    prices = [c["_sold_price"] for c in comps]
-    psf = [c["_sold_price"] / c["_sqft"] for c in comps if c.get("_sqft")]
-    median_price = float(pd.Series(prices).median())
-    avg_psf = sum(psf) / len(psf) if psf else None
-    arv = avg_psf * float(subject_sqft) if avg_psf and subject_sqft else median_price
-    return arv, avg_psf, median_price
+        return None, None, None
+    usable = [c for c in comps[:top_n] if c.get("_price_per_sqft") and c.get("_score")]
+    if not usable:
+        prices = [c.get("_sale_price") for c in comps[:top_n] if c.get("_sale_price")]
+        return (sum(prices) / len(prices) if prices else None), None, None
+    total_weight = sum(max(c["_score"], 1) for c in usable)
+    weighted_psf = sum(c["_price_per_sqft"] * max(c["_score"], 1) for c in usable) / total_weight
+    arv = weighted_psf * float(subject_sqft) if subject_sqft else None
+    median_price = float(pd.Series([c["_sale_price"] for c in usable]).median())
+    return arv, weighted_psf, median_price
+
+
+def confidence_score(comps):
+    if not comps:
+        return 0
+    n = min(len(comps), 5)
+    avg_score = sum(c.get("_score", 0) for c in comps[:5]) / n
+    count_bonus = min(15, len(comps) * 3)
+    return int(min(99, max(0, avg_score * 0.55 + count_bonus)))
+
+
+def render_contact_actions(phone, label="Contact", sms_body=""):
+    tel = call_link(phone)
+    sms = sms_link(phone, sms_body)
+    if not tel:
+        st.caption(f"No phone loaded for {label} yet.")
+        return
+    st.markdown(f"[📞 Call {label}]({tel}) &nbsp;&nbsp; [💬 SMS {label}]({sms})", unsafe_allow_html=True)
 
 # -------------------------
 # UI
 # -------------------------
 st.title("🏠 Newcastle AI Acquisition Analyzer")
-st.caption("V1: Address → property type → sold comps → ARV → MAO → offer strategy")
+st.caption("Realie-powered V2: accurate property type lock → verified comps → weighted ARV → MAO")
 
 with st.sidebar:
     st.header("Settings")
-    use_sample = st.toggle("Preview with sample data", value=not bool(RENTCAST_API_KEY))
-    st.caption("Turn this off after your Streamlit secrets are added.")
+    st.success("Primary Data Source: Realie")
+    st.caption("RentCast is no longer used for final comps.")
     repair_estimate = st.number_input("Repair Estimate", min_value=0, value=58000, step=1000)
     min_comps = st.number_input("Minimum comps before fallback", min_value=1, max_value=10, value=3)
-
-
+    show_debug = st.toggle("Show API diagnostics", value=False)
     st.divider()
-    st.header("Realie API Test")
-    st.caption("Uses REALIE_API_KEY in Streamlit Secrets. Realie uses Authorization header, not X-API-Key.")
-    realie_test_type = st.selectbox("Realie test type", ["Property Search", "Premium Comparables", "Search + Auto Comps", "Legacy Address Lookup"], index=0)
-
-    realie_state = st.text_input("State", value="CA")
-    realie_street = st.text_input("Street address only", value="1342 Branham Ln")
-    realie_unit = st.text_input("Unit only", value="1")
-    realie_city = st.text_input("City", value="San Jose")
-    realie_county = st.text_input("County", value="Santa Clara")
-
-    if realie_test_type == "Property Search":
-        if st.button("Test Realie Property Search", use_container_width=True):
-            result = realie_property_search(realie_state, realie_street, realie_unit, realie_city, realie_county, True, 10)
-            st.write("Realie property search result")
-            st.json(result)
-
-    elif realie_test_type == "Premium Comparables":
-        st.caption("Use latitude/longitude from Property Search response if available.")
-        realie_lat = st.text_input("Latitude", value="")
-        realie_lon = st.text_input("Longitude", value="")
-        realie_radius = st.number_input("Radius miles", min_value=0.1, value=0.5, step=0.1)
-        realie_months = st.number_input("Months back", min_value=1, value=6, step=1)
-        realie_sqft_min = st.text_input("SqFt min", value="510")
-        realie_sqft_max = st.text_input("SqFt max", value="1110")
-        realie_beds = st.text_input("Beds exact", value="2")
-        realie_baths = st.text_input("Baths exact", value="1")
-        realie_type = st.selectbox("Property type", ["condo", "house", "any"], index=0)
-        if st.button("Test Realie Premium Comparables", use_container_width=True):
-            if not realie_lat or not realie_lon:
-                st.error("Latitude and longitude are required for Realie comparables.")
-            else:
-                result = realie_comparables_search(
-                    realie_lat, realie_lon, realie_radius, realie_months, 25,
-                    realie_sqft_min, realie_sqft_max, realie_beds, realie_baths, realie_type
-                )
-                st.write("Realie premium comparables result")
-                st.json(result)
-
-    elif realie_test_type == "Search + Auto Comps":
-        st.caption("This searches the property first, tries to extract lat/lon, then runs Premium Comparables automatically.")
-        if st.button("Test Realie Search + Auto Comps", use_container_width=True):
-            search_result = realie_property_search(realie_state, realie_street, realie_unit, realie_city, realie_county, True, 10)
-            st.write("Step 1: Property Search")
-            st.json(search_result)
-            prop = extract_first_property(search_result)
-            lat, lon = extract_lat_lon_from_property(prop) if prop else (None, None)
-            st.write({"lat_found": lat, "lon_found": lon})
-            if lat and lon:
-                comps_result = realie_comparables_search(lat, lon, 0.5, 6, 25, 510, 1110, 2, 1, "condo")
-                st.write("Step 2: Premium Comparables")
-                st.json(comps_result)
-            else:
-                st.warning("Property search worked, but I could not find latitude/longitude in the first result. Send this screenshot so we can map Realie's field names.")
-
-    else:
-        if st.button("Test Realie Legacy Address Lookup", use_container_width=True):
-            result = realie_address_lookup(realie_state, realie_street, realie_unit, realie_city, realie_county)
-            st.write("Realie legacy address lookup result")
-            st.json(result)
-
-
-    st.divider()
-    st.header("DealRun API Test")
-    st.caption("Temporary tester. Add DEALRUN_API_KEY in Streamlit Secrets first.")
-    dealrun_base = st.selectbox(
-        "Base URL",
-        ["https://api.dealrun.ai", "https://app.dealrun.ai/api", "https://app.dealrun.ai", "https://dealrun.ai/api"],
-        index=0,
-    )
-    dealrun_path = st.text_input("Endpoint path", value="/", help="Try /, /api, /v1, /deals, /comps, /properties, /buyers")
-    dealrun_method = st.selectbox("Method", ["GET", "POST"], index=0)
-    dealrun_auth = st.selectbox("Auth style", ["Bearer token", "X-API-Key", "Token header", "api_key query"], index=0)
-    dealrun_addr = st.text_input("Optional test address", value="1342 Branham Ln #1, San Jose, CA 95118")
-    if st.button("Test DealRun API", use_container_width=True):
-        result = dealrun_request(dealrun_base, dealrun_path, dealrun_method, dealrun_auth, dealrun_addr)
-        st.write("DealRun test result")
-        st.json(result)
-
-
+    st.subheader("Contact Actions")
+    st.caption("Call/SMS links open your Mac/iPhone default calling or Messages app.")
 
 col1, col2 = st.columns([2, 1])
 with col1:
     address = st.text_input("Property Address", value="1342 Branham Ln #1, San Jose, CA 95118")
+    parsed = parse_input_address(address)
+    with st.expander("Address details / override", expanded=False):
+        street = st.text_input("Street only", value=parsed["street"])
+        unit = st.text_input("Unit only", value=parsed["unit"])
+        city = st.text_input("City", value=parsed["city"] or "San Jose")
+        county = st.text_input("County", value="Santa Clara")
+        state = st.text_input("State", value=parsed["state"] or "CA")
+    seller_phone = st.text_input("Seller Phone (optional, for Call/SMS buttons)", placeholder="8182534663")
     photo_link = st.text_input("Dropbox / Google Drive Photo Link", placeholder="Paste photo folder link here")
 with col2:
     uploaded_photos = st.file_uploader("Upload Property Photos", accept_multiple_files=True, type=["png", "jpg", "jpeg", "webp"])
@@ -996,158 +505,154 @@ if uploaded_photos:
 analyze = st.button("Analyze Property", type="primary", use_container_width=True)
 
 if analyze:
-    address = normalize_address(address)
-    errors = []
-    if use_sample:
-        subject_record, avm_data, err = sample_result()
-        subject_attrs = get_subject_attrs(subject_record, avm_data)
-        raw_comps = [normalize_comp_record(c, subject_attrs, source="Sample AVM Sale Comp", verified_sale_comp=True) for c in extract_comps(avm_data)]
-        record_count = 0
-        avm_count = len(raw_comps)
-        rejected_count = 0
-    else:
-        subject_record, err = get_property_record(address)
-        if err: errors.append(err)
-        avm_data, err = get_value_and_comps(address, radius=1.0)
-        if err: errors.append(err)
-        subject_attrs = get_subject_attrs(subject_record, avm_data)
+    if not REALIE_API_KEY:
+        st.error("Missing REALIE_API_KEY in Streamlit Secrets. Add it before using Analyze Property.")
+        st.stop()
 
-        avm_comps = [normalize_comp_record(c, subject_attrs, source="RentCast AVM Sale Comp", verified_sale_comp=True) for c in extract_comps(avm_data)]
+    with st.spinner("Searching Realie property data..."):
+        props, params_used, err = realie_property_search(state, street, county=county, city=city, unit=unit, limit=10)
 
-        # Property Records are NOT allowed to create comps or ARV.
-        # They are used only to verify/enrich AVM sale comps and reject stale/conflicting records.
-        record_comps_12, err = get_sold_property_records(address, subject_attrs, radius=1.0, days=365, sqft_tolerance=700, strict_type=True, strict_beds=False, strict_baths=False)
-        if err: errors.append(err)
-        record_comps_24, err = get_sold_property_records(address, subject_attrs, radius=1.5, days=730, sqft_tolerance=900, strict_type=True, strict_beds=False, strict_baths=False) if len(record_comps_12) < min_comps else ([], None)
-        if err: errors.append(err)
-        record_comps_raw = record_comps_12 + record_comps_24
+    if err and not props:
+        st.error(err)
+        st.info("Try spelling out the street suffix, for example Lane instead of Ln.")
+        st.stop()
 
-        verified_avm_comps, rejected_comps = reject_stale_or_conflicting_avm_comps(avm_comps, record_comps_raw)
-        raw_comps = verified_avm_comps
-        record_count = len(record_comps_raw)
-        avm_count = len(avm_comps)
-        rejected_count = len(rejected_comps)
+    subject = choose_subject_property(props, requested_unit=unit)
+    if not subject:
+        st.error("No subject property found.")
+        st.stop()
 
-    comps, comp_window = find_best_comps(raw_comps, subject_attrs, min_comps=min_comps)
+    property_type_label, property_type_api = subject_property_type(subject)
+    subject_sqft = subject.get("livingArea") or subject.get("buildingArea")
+    subject_addr = subject.get("addressFull") or address
 
-    if errors:
-        for e in errors:
-            st.error(e)
+    with st.spinner("Finding strict same-property-type sold comps..."):
+        comps, diagnostics, comp_err = progressive_comp_search(subject, property_type_api, property_type_label, min_comps)
 
+    # Header / status
     st.subheader("Subject Property")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Property Type", subject_attrs.get("family") or "—")
-    c2.metric("Beds", subject_attrs.get("beds") or "—")
-    c3.metric("Baths", subject_attrs.get("baths") or "—")
-    c4.metric("House SqFt", number(subject_attrs.get("sqft")))
-    c5.metric("Lot SqFt", number(subject_attrs.get("lot")))
-    c6.metric("Year Built", subject_attrs.get("year") or "—")
-    st.caption(f"Raw property type returned by data source: {subject_attrs.get('raw_type') or 'Unknown'}")
-    st.caption(f"Comp data pulled: {len(raw_comps)} usable AVM comp candidates ({record_count} property records checked for buyer/owner enrichment + {avm_count} AVM comps pulled).")
-    if 'rejected_count' in locals() and rejected_count:
-        st.warning(f"{rejected_count} comp(s) were flagged during enrichment review.")
-        with st.expander("Show rejected comps"):
-            st.dataframe(pd.DataFrame(rejected_comps), hide_index=True, use_container_width=True)
+    st.markdown(
+        f"""
+        <div class="card">
+        <b>{subject_addr}</b><br>
+        <span class="pill">Property Type Locked: {property_type_label}</span>
+        <span class="pill">Parcel: {subject.get('parcelId') or '—'}</span>
+        <span class="pill">Subdivision: {subject.get('subdivision') or '—'}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    arv, avg_psf, median_price = calculate_arv(comps, subject_attrs.get("sqft"), avm_data)
-    st.subheader("ARV + Offer Matrix")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Beds", subject.get("totalBedrooms") or "—")
+    c2.metric("Baths", subject.get("totalBathrooms") or "—")
+    c3.metric("House SqFt", number(subject_sqft))
+    c4.metric("Lot SqFt", number(subject.get("lotSizeArea") or subject.get("landArea")))
+    c5.metric("Year Built", subject.get("yearBuilt") or "—")
+
+    o1, o2, o3, o4 = st.columns(4)
+    o1.metric("Owner", subject.get("ownerName") or "—")
+    o2.metric("Est. Equity", money(subject.get("equityCurrentEstBal")))
+    o3.metric("Lien Balance", money(subject.get("totalLienBalance")))
+    o4.metric("Realie AVM", money(subject.get("modelValue")))
+
+    if seller_phone:
+        st.markdown("**Seller Call/SMS**")
+        render_contact_actions(seller_phone, "Seller", f"Hi, this is Marco with Newcastle Partners. I wanted to follow up about {subject_addr}.")
+
+    if comp_err:
+        st.error(comp_err)
+
+    # ARV
+    arv, weighted_psf, median_price = weighted_arv(comps, subject_sqft, top_n=5)
+    conf = confidence_score(comps)
+
+    st.subheader("Weighted ARV + Offer Matrix")
     a1, a2, a3, a4 = st.columns(4)
     a1.metric("Recommended ARV", money(arv))
-    a2.metric("Average $/SqFt", money(avg_psf) if avg_psf else "—")
-    a3.metric("Median Comp Price", money(median_price))
-    a4.metric("Comp Rule Used", comp_window)
+    a2.metric("Weighted $/SqFt", money(weighted_psf) if weighted_psf else "—")
+    a3.metric("Median Top-Comp Price", money(median_price))
+    a4.metric("ARV Confidence", f"{conf}%" if conf else "—")
 
     tiers = [("75% ARV", 0.75), ("70% ARV", 0.70), ("65% ARV", 0.65), ("60% ARV", 0.60)]
     tier_cols = st.columns(4)
     for col, (label, pct) in zip(tier_cols, tiers):
-        gross_offer = (arv * pct) if arv else None
-        repair_adjusted = (gross_offer - repair_estimate) if gross_offer is not None else None
-        col.metric(label, money(gross_offer))
-        col.caption(f"Before repairs. After repairs: {money(repair_adjusted)}")
+        gross = (arv * pct) if arv else None
+        net = (gross - repair_estimate) if gross else None
+        col.metric(label, money(gross))
+        col.caption(f"After repairs: {money(net)}")
 
-    st.subheader("Sold Comparable Sales")
-    st.caption("SOLD comps only. ARV and the comp table use RentCast AVM sale comparable listings. Buyer/owner is enriched from matching property records when available. If blank, the comp source did not return buyer data.")
+    st.subheader("Verified Sold Comparable Sales")
+    st.caption("Rules: same property type only, starts with 0.5 mi / 6 months / ±300 sqft, then falls back only if fewer than your minimum comp count are found.")
 
     if not comps:
-        st.warning("No comps matched after filtering. The app did pull candidate records above; next step is to review/widen the criteria or inspect source fields.")
-        if raw_comps:
-            with st.expander("Show raw comp candidates for troubleshooting"):
-                preview = []
-                for c in raw_comps[:25]:
-                    sale_date, sale_price = verified_sale(c)
-                    preview.append({
-                        "Address": comp_field(c, "formattedAddress", "address", "addressLine1"),
-                        "Type": raw_property_type(c) or c.get("propertyType"),
-                        "Beds": comp_field(c, "bedrooms", "beds"),
-                        "Baths": comp_field(c, "bathrooms", "baths"),
-                        "SqFt": comp_field(c, "squareFootage", "sqft", "livingArea"),
-                        "Sale Date": fmt_date(sale_date),
-                        "Sale Price": money(sale_price) if sale_price else "—",
-                        "Buyer / Current Owner": owner_name(c) or comp_field(c, "buyerName") or "—",
-                        "Distance": comp_field(c, "distance", "distanceMiles"),
-                        "Source": c.get("_source", "RentCast"),
-                    })
-                st.dataframe(pd.DataFrame(preview), hide_index=True, use_container_width=True)
+        st.warning("No comps passed the strict Realie filters. Check diagnostics or manually widen criteria.")
     else:
         rows = []
         for c in comps:
-            comp_addr = comp_field(c, "formattedAddress", "address", "addressLine1") or "Unknown address"
-            buyer = owner_name(c) or comp_field(c, "buyerName", "buyer", "ownerName", "owner") or "Buyer name pending"
-            investor = is_likely_investor(str(buyer))
-            sqft = comp_field(c, "squareFootage", "sqft", "livingArea")
-            lot = comp_field(c, "lotSize", "lotSquareFootage")
-            dist = comp_field(c, "distance", "distanceMiles")
-            _, sold_price = verified_sale(c)
-            ppsf = float(sold_price) / float(sqft) if sold_price and sqft else None
-            sale_date_display, _ = verified_sale(c)
+            comp_addr = c.get("addressFull") or c.get("addressUnit") or c.get("address") or c.get("addressRaw") or "Unknown"
             links = maps_links(comp_addr)
+            buyer = c.get("grantee") or c.get("ownerName") or "—"
             rows.append({
-                "Photo": comp_field(c, "photo", "imageUrl", "thumbnail") or "",
-                "Sold Date": fmt_date(sale_date_display),
+                "Match Score": c.get("_score"),
+                "Sold Date": fmt_date(c.get("_sale_date")),
                 "Address": comp_addr,
-                "Property Type": c.get("_family") or property_family(c),
-                "Distance": f"{float(dist):.2f} mi" if dist is not None else "—",
-                "Beds": comp_field(c, "bedrooms", "beds") or "—",
-                "Baths": comp_field(c, "bathrooms", "baths") or "—",
-                "House SqFt": number(sqft),
-                "Lot SqFt": number(lot),
-                "$/SqFt": money(ppsf) if ppsf else "—",
-                "AVM Sale Price": money(sold_price),
-                "Buyer / Current Owner": buyer,
-                "Investor?": "YES" if investor else "NO",
-                "Buyer Source": c.get("_buyer_enrichment_source", "Not returned" if buyer == "Buyer name pending" else "Comp source"),
-                "Sale Source": c.get("_source", "RentCast"),
-                "Sale Source Type": "AVM Sale Comp" if c.get("_verified_sale") else "Unverified",
+                "Distance": f"{c.get('_distance'):.2f} mi" if c.get("_distance") is not None else "—",
+                "Beds": c.get("totalBedrooms") or "—",
+                "Baths": c.get("totalBathrooms") or "—",
+                "House SqFt": number(c.get("livingArea") or c.get("buildingArea")),
+                "Lot SqFt": number(c.get("lotSizeArea") or c.get("landArea")),
+                "Recorded Sale Price": money(c.get("_sale_price")),
+                "$/SqFt": money(c.get("_price_per_sqft")),
+                "Buyer / Grantee": buyer,
+                "Investor?": "YES" if is_likely_investor(str(buyer)) else "NO",
+                "Sale Source": c.get("_sale_source"),
                 "Redfin": links["Redfin"],
                 "Zillow": links["Zillow"],
-                "Map": links["Map"],
+                "Map": links["Google Maps"],
                 "Street View": links["Street View"],
-                "Satellite": links["Satellite"],
             })
         df = pd.DataFrame(rows)
         st.dataframe(
             df,
             column_config={
-                "Photo": st.column_config.ImageColumn("Photo", width="small"),
                 "Redfin": st.column_config.LinkColumn("Redfin", display_text="Open"),
                 "Zillow": st.column_config.LinkColumn("Zillow", display_text="Open"),
                 "Map": st.column_config.LinkColumn("Map", display_text="Map"),
-                "Street View": st.column_config.LinkColumn("Street View", display_text="Street"),
-                "Satellite": st.column_config.LinkColumn("Satellite", display_text="Satellite"),
+                "Street View": st.column_config.LinkColumn("Street", display_text="Street"),
             },
             hide_index=True,
             use_container_width=True,
         )
 
     st.subheader("AI Acquisition Notes")
-    if arv:
+    if arv and comps:
+        top = comps[:min(5, len(comps))]
+        avg_dist = sum([c.get("_distance") or 0 for c in top]) / len(top)
         st.markdown(f"""
         <div class="card">
-        <b>Property type logic:</b> Subject was classified as <b>{subject_attrs.get('family')}</b>. The comp engine first looks for matching property types before widening criteria.<br><br>
-        <b>Comp rule used:</b> {comp_window}.<br><br>
-        <b>Recommended starting point:</b> Use the 70% ARV tier unless buyer demand is extremely strong.<br><br>
-        <b>Next step:</b> Review photos, Street View, and condition outliers before making the final offer.
+        <b>Recommendation:</b> Review top {len(top)} Realie comps before making the final offer.<br><br>
+        <b>Property type lock:</b> {property_type_label} comps only. No silent mixing with other property types.<br><br>
+        <b>Comp quality:</b> {len(comps)} verified sales passed filters. Average top-comp distance: {avg_dist:.2f} miles. Confidence: {conf}%.<br><br>
+        <b>Starting offer guidance:</b> Use the 70% ARV tier after repairs as your normal wholesale starting point, then adjust based on seller motivation and condition/photos.<br><br>
+        <b>Next feature:</b> Buyer phone/email enrichment can populate the Call/SMS buttons directly in the buyer table once we connect a supported contact provider.
         </div>
         """, unsafe_allow_html=True)
     else:
-        st.info("Run live data or adjust filters to generate AI notes.")
+        st.info("Need valid Realie comps to generate full AI notes.")
+
+    if show_debug:
+        st.subheader("API Diagnostics")
+        st.json({"property_search_params_used": params_used, "chosen_subject": subject, "comp_rounds": diagnostics})
+
+# Basic standalone contact launcher section
+st.divider()
+st.subheader("Quick Call / SMS Launcher")
+st.caption("Enter any phone number and click Call or SMS. This opens the default phone or Messages app on your Mac/iPhone.")
+quick_cols = st.columns([2, 3])
+with quick_cols[0]:
+    quick_phone = st.text_input("Phone number", key="quick_phone", placeholder="8182534663")
+with quick_cols[1]:
+    quick_msg = st.text_input("SMS message", key="quick_msg", placeholder="Hi, this is Marco with Newcastle Partners...")
+if clean_phone(quick_phone):
+    st.markdown(f"[📞 Call](tel:+1{clean_phone(quick_phone)}) &nbsp;&nbsp; [💬 SMS](sms:+1{clean_phone(quick_phone)}&body={quote_plus(quick_msg)})", unsafe_allow_html=True)
