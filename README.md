@@ -1,32 +1,12 @@
-# Newcastle AI Acquisition Analyzer
+# Newcastle AI Acquisition Analyzer - Verified Comps Fix
 
-Streamlit MVP for Newcastle Partners CA LLC.
+This patch fixes stale/incorrect comp prices by separating valuation comps from enrichment records.
 
-## Features
-- Address-based property analysis
-- RentCast API hooks for property data and sold comps
-- DealMachine API hook placeholder for buyer/owner enrichment
-- Sold comps only
-- 6-month comp window first, fallback to 12 months
-- Exact beds/baths and +/- 300 sqft filters
-- Lot sqft display
-- MM/DD/YYYY sold date format
-- Most recent sold comps first
-- Buyer name / likely investor flag
-- Redfin, Google Maps, Street View, Satellite links
-- Photo upload and Dropbox/Google Drive photo link field
-- 75%, 70%, 65%, and 60% ARV MAO tiers minus repairs
+## What changed
+- ARV/comp table now prioritizes verified RentCast AVM sale comps.
+- RentCast property records are used for buyer/current-owner enrichment only.
+- Property record prices/dates no longer overwrite verified sale comp prices/dates.
+- Adds Sale Source and Sale Verified columns.
+- Keeps property-type matching: condo/townhome vs SFR vs multifamily.
 
-## Streamlit secrets
-Do not commit API keys to GitHub. Add them in Streamlit Community Cloud under Advanced settings:
-
-```toml
-RENTCAST_API_KEY = "your_rentcast_key_here"
-DEALMACHINE_API_KEY = "your_dealmachine_key_here"
-```
-
-## Local run
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+Upload `app.py` and `requirements.txt` to GitHub and commit changes.

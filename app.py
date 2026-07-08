@@ -123,26 +123,52 @@ def owner_name(record):
 
 
 def latest_sale(record):
-    """Return most recent sale date/price from direct fields or RentCast history."""
+    """Legacy helper. Prefer verified_sale() for comp valuation."""
     sale_date = comp_field(record, "soldDate", "lastSaleDate", "saleDate", "closeDate")
     sale_price = comp_field(record, "soldPrice", "lastSalePrice", "salePrice", "price")
-    history = record.get("history") if isinstance(record, dict) else None
-    if isinstance(history, dict) and history:
-        sale_events = []
-        for key, event in history.items():
-            if not isinstance(event, dict):
-                continue
-            d = event.get("date") or key
-            dt = parse_date(d)
-            price = event.get("price")
-            if dt and price:
-                sale_events.append((dt, d, price))
-        if sale_events:
-            sale_events.sort(key=lambda x: x[0], reverse=True)
-            sale_date = sale_date or sale_events[0][1]
-            sale_price = sale_price or sale_events[0][2]
     return sale_date, sale_price
 
+
+def history_sale(record):
+    """Find the newest true sale event from RentCast sale history.
+    This avoids treating tax/assessment/public-record update dates as sold comps.
+    """
+    history = record.get("history") if isinstance(record, dict) else None
+    if not isinstance(history, dict) or not history:
+        return None, None
+    sale_events = []
+    for key, event in history.items():
+        if not isinstance(event, dict):
+            continue
+        event_text = " ".join(str(event.get(k, "")) for k in ["event", "eventType", "type", "status"]).lower()
+        price = event.get("price") or event.get("salePrice") or event.get("soldPrice")
+        d = event.get("date") or key
+        dt = parse_date(d)
+        # Only trust actual sale/sold events with a real price.
+        if dt and price and ("sold" in event_text or "sale" in event_text or event_text == ""):
+            sale_events.append((dt, d, price))
+    if not sale_events:
+        return None, None
+    sale_events.sort(key=lambda x: x[0], reverse=True)
+    return sale_events[0][1], sale_events[0][2]
+
+
+def verified_sale(record):
+    """Return only a sale date/price pair that is safe to use for valuation.
+
+    Important: RentCast property records can include dates/prices that do not match
+    MLS/Redfin sale history. We therefore use property records mainly for owner/buyer
+    enrichment and use AVM sale comparables for ARV unless a true sale-history event
+    is available.
+    """
+    if not isinstance(record, dict):
+        return None, None
+    if record.get("_verified_sale") is True:
+        return comp_field(record, "soldDate", "closeDate", "saleDate", "lastSaleDate"), comp_field(record, "soldPrice", "salePrice", "price", "lastSalePrice")
+    if record.get("_source") == "RentCast Records - Owner Enrichment":
+        return history_sale(record)
+    # Default fallback for AVM/listing comparable records only.
+    return comp_field(record, "soldDate", "closeDate", "saleDate"), comp_field(record, "soldPrice", "salePrice", "price")
 
 def same_property_address(a, b):
     def clean(x):
@@ -323,27 +349,42 @@ def get_sold_property_records(address: str, subject_attrs: dict, radius: float =
     return list(unique.values()), "; ".join(errors) if errors else None
 
 
-def normalize_comp_record(record, subject_attrs=None):
+def normalize_comp_record(record, subject_attrs=None, source="RentCast", verified_sale_comp=False):
     c = dict(record or {})
-    sale_date, sale_price = latest_sale(c)
+    c["_source"] = source
+    c["_verified_sale"] = bool(verified_sale_comp)
+
+    # Only stamp soldDate/soldPrice when this is a verified sale comp.
+    # For property records, keep buyer/current owner enrichment but do NOT let
+    # unverified record prices drive the ARV.
+    sale_date, sale_price = verified_sale(c)
     if sale_date is not None:
         c["soldDate"] = sale_date
     if sale_price is not None:
         c["soldPrice"] = sale_price
+        if verified_sale_comp:
+            c["_verified_sale"] = True
+
     buyer = owner_name(c)
     if buyer:
         c["buyerName"] = buyer
+
     if subject_attrs:
         dist = comp_field(c, "distance", "distanceMiles")
         if dist is None:
             dist = haversine_miles(subject_attrs.get("lat"), subject_attrs.get("lon"), c.get("latitude"), c.get("longitude"))
         if dist is not None:
             c["distance"] = dist
-    c["_source"] = c.get("_source") or "RentCast Records"
     return c
 
-
 def merge_comps(*lists):
+    """Merge comps by address, preserving verified AVM sale date/price.
+
+    Property records are valuable for buyer/current-owner enrichment, but they can
+    carry stale or non-MLS sale data. If a record is not a verified sale comp, it
+    can enrich buyer/owner/lot/photo fields but cannot overwrite verified sale date
+    or sale price.
+    """
     merged = {}
     for items in lists:
         for item in items or []:
@@ -351,12 +392,31 @@ def merge_comps(*lists):
             key = re.sub(r"[^A-Z0-9]", "", str(addr).upper())
             if key not in merged:
                 merged[key] = item
-            else:
-                # Prefer record data because it usually has owner/buyer and sale history.
-                existing = merged[key]
-                combined = dict(existing)
-                combined.update({k:v for k,v in item.items() if v not in [None, "", []]})
+                continue
+
+            existing = dict(merged[key])
+            item_verified = item.get("_verified_sale") is True
+            existing_verified = existing.get("_verified_sale") is True
+
+            if item_verified and not existing_verified:
+                combined = dict(item)
+                # Bring over owner/buyer enrichment from the property record if available.
+                for k in ["buyerName", "owner", "ownerName", "currentOwnerName", "photo", "imageUrl", "thumbnail", "lotSize", "lotSquareFootage"]:
+                    if existing.get(k) not in [None, "", []] and combined.get(k) in [None, "", []]:
+                        combined[k] = existing.get(k)
                 merged[key] = combined
+            elif existing_verified and not item_verified:
+                # Preserve verified sale values; only enrich missing non-sale fields.
+                for k in ["buyerName", "owner", "ownerName", "currentOwnerName", "photo", "imageUrl", "thumbnail", "lotSize", "lotSquareFootage"]:
+                    if item.get(k) not in [None, "", []] and existing.get(k) in [None, "", []]:
+                        existing[k] = item.get(k)
+                merged[key] = existing
+            else:
+                # Same trust level: fill blanks only, don't overwrite populated fields.
+                for k, v in item.items():
+                    if existing.get(k) in [None, "", []] and v not in [None, "", []]:
+                        existing[k] = v
+                merged[key] = existing
     return list(merged.values())
 
 # -------------------------
@@ -419,7 +479,7 @@ def filter_comps(raw_comps, subject_attrs, months=6, radius=0.5, sqft_tolerance=
     subject_family = subject_attrs.get("family", "Unknown")
     filtered = []
     for c in raw_comps:
-        raw_sale_date, raw_sold_price = latest_sale(c)
+        raw_sale_date, raw_sold_price = verified_sale(c)
         sale_date = parse_date(raw_sale_date)
         sold_price = raw_sold_price
         beds = comp_field(c, "bedrooms", "beds")
@@ -532,7 +592,7 @@ if analyze:
     if use_sample:
         subject_record, avm_data, err = sample_result()
         subject_attrs = get_subject_attrs(subject_record, avm_data)
-        raw_comps = [normalize_comp_record(c, subject_attrs) for c in extract_comps(avm_data)]
+        raw_comps = [normalize_comp_record(c, subject_attrs, source="Sample AVM Sale Comp", verified_sale_comp=True) for c in extract_comps(avm_data)]
         record_count = len(raw_comps)
         avm_count = len(raw_comps)
     else:
@@ -542,7 +602,7 @@ if analyze:
         if err: errors.append(err)
         subject_attrs = get_subject_attrs(subject_record, avm_data)
 
-        avm_comps = [normalize_comp_record(c, subject_attrs) for c in extract_comps(avm_data)]
+        avm_comps = [normalize_comp_record(c, subject_attrs, source="RentCast AVM Sale Comp", verified_sale_comp=True) for c in extract_comps(avm_data)]
 
         # Pull detailed SOLD comps from RentCast Property Records. This is what gives us
         # last sale price/date and current owner/buyer names for the comp table.
@@ -550,7 +610,7 @@ if analyze:
         if err: errors.append(err)
         record_comps_24, err = get_sold_property_records(address, subject_attrs, radius=1.5, days=730, sqft_tolerance=900, strict_type=True, strict_beds=False, strict_baths=False) if len(record_comps_12) < min_comps else ([], None)
         if err: errors.append(err)
-        record_comps = [normalize_comp_record(c, subject_attrs) for c in (record_comps_12 + record_comps_24)]
+        record_comps = [normalize_comp_record(c, subject_attrs, source="RentCast Records - Owner Enrichment", verified_sale_comp=False) for c in (record_comps_12 + record_comps_24)]
 
         raw_comps = merge_comps(record_comps, avm_comps)
         record_count = len(record_comps)
@@ -589,7 +649,7 @@ if analyze:
         col.caption(f"{label} - repairs")
 
     st.subheader("Sold Comparable Sales")
-    st.caption("SOLD comps only. Pulls RentCast Property Records first for buyer/current-owner names, then blends AVM comps. Property type is matched first: condo/townhome vs single-family vs multifamily.")
+    st.caption("SOLD comps only. ARV uses verified AVM sale comps first. Property records are used for buyer/current-owner enrichment only unless a true sale-history event is available. Property type is matched first: condo/townhome vs single-family vs multifamily.")
 
     if not comps:
         st.warning("No comps matched after filtering. The app did pull candidate records above; next step is to review/widen the criteria or inspect source fields.")
@@ -597,7 +657,7 @@ if analyze:
             with st.expander("Show raw comp candidates for troubleshooting"):
                 preview = []
                 for c in raw_comps[:25]:
-                    sale_date, sale_price = latest_sale(c)
+                    sale_date, sale_price = verified_sale(c)
                     preview.append({
                         "Address": comp_field(c, "formattedAddress", "address", "addressLine1"),
                         "Type": raw_property_type(c) or c.get("propertyType"),
@@ -620,12 +680,13 @@ if analyze:
             sqft = comp_field(c, "squareFootage", "sqft", "livingArea")
             lot = comp_field(c, "lotSize", "lotSquareFootage")
             dist = comp_field(c, "distance", "distanceMiles")
-            sold_price = comp_field(c, "soldPrice", "lastSalePrice", "salePrice", "price")
+            _, sold_price = verified_sale(c)
             ppsf = float(sold_price) / float(sqft) if sold_price and sqft else None
+            sale_date_display, _ = verified_sale(c)
             links = maps_links(comp_addr)
             rows.append({
                 "Photo": comp_field(c, "photo", "imageUrl", "thumbnail") or "",
-                "Sold Date": fmt_date(comp_field(c, "soldDate", "lastSaleDate", "saleDate", "closeDate")),
+                "Sold Date": fmt_date(sale_date_display),
                 "Address": comp_addr,
                 "Property Type": c.get("_family") or property_family(c),
                 "Distance": f"{float(dist):.2f} mi" if dist is not None else "—",
@@ -637,7 +698,8 @@ if analyze:
                 "Recorded Sale Price": money(sold_price),
                 "Buyer": buyer,
                 "Investor?": "YES" if investor else "NO",
-                "Source": c.get("_source", "RentCast"),
+                "Sale Source": c.get("_source", "RentCast"),
+                "Sale Verified?": "YES" if c.get("_verified_sale") else "HISTORY",
                 "Redfin": links["Redfin"],
                 "Zillow": links["Zillow"],
                 "Map": links["Map"],
