@@ -195,6 +195,56 @@ def build_record_lookup(records):
     return lookup
 
 
+
+
+def address_alias_key(addr):
+    """Normalize address for fuzzy unit matching, e.g. Unit 1, #1, Apt 1."""
+    x = str(addr or "").upper()
+    # Keep only the portion before city/state noise when possible
+    x = x.replace(" APARTMENT ", " UNIT ").replace(" APT ", " UNIT ").replace(" STE ", " UNIT ").replace(" SUITE ", " UNIT ")
+    x = re.sub(r"#\s*([A-Z0-9]+)", r" UNIT \1", x)
+    x = re.sub(r"\bUNIT\s*#?\s*", " UNIT ", x)
+    x = re.sub(r"\bDRIVE\b", "DR", x)
+    x = re.sub(r"\bLANE\b", "LN", x)
+    x = re.sub(r"\bAVENUE\b", "AVE", x)
+    x = re.sub(r"\bSTREET\b", "ST", x)
+    x = re.sub(r"[^A-Z0-9]+", " ", x).strip()
+    return re.sub(r"\s+", "", x)
+
+
+def loose_address_key(addr):
+    """A looser key that removes unit words but keeps the unit number."""
+    x = address_alias_key(addr)
+    return x.replace("UNIT", "")
+
+
+def matching_record_for_address(addr, records):
+    if not addr or not records:
+        return None
+    target_exact = normalized_address_key(addr)
+    target_alias = address_alias_key(addr)
+    target_loose = loose_address_key(addr)
+    best = None
+    for rec in records or []:
+        raddr = comp_field(rec, "formattedAddress", "address", "addressLine1")
+        keys = {normalized_address_key(raddr), address_alias_key(raddr), loose_address_key(raddr)}
+        if target_exact in keys or target_alias in keys or target_loose in keys:
+            return rec
+        # fallback: same street number and same unit number when available
+        ta = address_alias_key(addr)
+        ra = address_alias_key(raddr)
+        if ta and ra:
+            tnum = re.match(r"(\d+)", ta)
+            rnum = re.match(r"(\d+)", ra)
+            tunit = re.search(r"UNIT([A-Z0-9]+)", ta)
+            runit = re.search(r"UNIT([A-Z0-9]+)", ra)
+            if tnum and rnum and tnum.group(1) == rnum.group(1):
+                if tunit and runit and tunit.group(1) == runit.group(1):
+                    return rec
+                if not best:
+                    best = rec
+    return best
+
 def sale_dates_close(d1, d2, max_days=45):
     dt1, dt2 = parse_date(d1), parse_date(d2)
     if not dt1 or not dt2:
@@ -223,11 +273,15 @@ def reject_stale_or_conflicting_avm_comps(avm_comps, property_records):
     for c in avm_comps or []:
         addr = comp_field(c, "formattedAddress", "address", "addressLine1")
         key = normalized_address_key(addr)
-        rec = lookup.get(key)
+        rec = lookup.get(key) or matching_record_for_address(addr, property_records)
         if rec:
             buyer = owner_name(rec)
             if buyer:
                 c["buyerName"] = buyer
+                c["_buyer_enrichment_source"] = "RentCast Property Record"
+            for k in ["owner", "ownerName", "currentOwnerName", "lotSize", "lotSquareFootage", "photo", "imageUrl", "thumbnail"]:
+                if rec.get(k) not in [None, "", []] and c.get(k) in [None, "", []]:
+                    c[k] = rec.get(k)
             for k in ["lotSize", "lotSquareFootage", "photo", "imageUrl", "thumbnail"]:
                 if c.get(k) in [None, "", []] and rec.get(k) not in [None, "", []]:
                     c[k] = rec.get(k)
@@ -719,7 +773,7 @@ if analyze:
         col.caption(f"Before repairs. After repairs: {money(repair_adjusted)}")
 
     st.subheader("Sold Comparable Sales")
-    st.caption("SOLD comps only. ARV and the comp table use RentCast AVM sale comparable listings. Property records are used only to enrich buyer/current-owner, lot, and photo fields when available.")
+    st.caption("SOLD comps only. ARV and the comp table use RentCast AVM sale comparable listings. Buyer/owner is enriched from matching property records when available. If blank, the comp source did not return buyer data.")
 
     if not comps:
         st.warning("No comps matched after filtering. The app did pull candidate records above; next step is to review/widen the criteria or inspect source fields.")
@@ -768,6 +822,7 @@ if analyze:
                 "AVM Sale Price": money(sold_price),
                 "Buyer / Current Owner": buyer,
                 "Investor?": "YES" if investor else "NO",
+                "Buyer Source": c.get("_buyer_enrichment_source", "Not returned" if buyer == "Buyer name pending" else "Comp source"),
                 "Sale Source": c.get("_source", "RentCast"),
                 "Sale Source Type": "AVM Sale Comp" if c.get("_verified_sale") else "Unverified",
                 "Redfin": links["Redfin"],
