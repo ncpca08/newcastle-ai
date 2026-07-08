@@ -20,6 +20,7 @@ def get_secret(name: str, default: str = "") -> str:
 
 RENTCAST_API_KEY = get_secret("RENTCAST_API_KEY")
 DEALMACHINE_API_KEY = get_secret("DEALMACHINE_API_KEY")
+DEALRUN_API_KEY = get_secret("DEALRUN_API_KEY")
 
 # -------------------------
 # STYLE
@@ -535,6 +536,69 @@ def merge_comps(*lists):
                 merged[key] = existing
     return list(merged.values())
 
+
+
+# -------------------------
+# DEALRUN API TESTER (temporary discovery tool)
+# -------------------------
+def dealrun_request(base_url: str, path: str, method: str = "GET", auth_mode: str = "Bearer", address: str = ""):
+    """Small safe tester to discover DealRun API behavior without exposing the key."""
+    if not DEALRUN_API_KEY:
+        return {"ok": False, "error": "Missing DEALRUN_API_KEY in Streamlit secrets."}
+
+    base_url = (base_url or "").strip().rstrip("/")
+    path = (path or "").strip()
+    if not path.startswith("/"):
+        path = "/" + path
+    url = base_url + path
+
+    headers = {"Accept": "application/json"}
+    params = {}
+    json_body = None
+
+    if auth_mode == "Bearer token":
+        headers["Authorization"] = f"Bearer {DEALRUN_API_KEY}"
+    elif auth_mode == "X-API-Key":
+        headers["X-API-Key"] = DEALRUN_API_KEY
+    elif auth_mode == "api_key query":
+        params["api_key"] = DEALRUN_API_KEY
+    elif auth_mode == "Token header":
+        headers["Authorization"] = f"Token {DEALRUN_API_KEY}"
+
+    if address:
+        # Try common address parameter names for GET. For POST, send JSON body.
+        if method == "GET":
+            params["address"] = address
+        else:
+            headers["Content-Type"] = "application/json"
+            json_body = {"address": address}
+
+    try:
+        if method == "GET":
+            r = requests.get(url, headers=headers, params=params, timeout=20)
+        else:
+            r = requests.post(url, headers=headers, params=params, json=json_body, timeout=20)
+
+        body_text = r.text or ""
+        body_preview = body_text[:3000]
+        try:
+            parsed = r.json()
+        except Exception:
+            parsed = None
+
+        return {
+            "ok": 200 <= r.status_code < 300,
+            "status_code": r.status_code,
+            "url_tested": url,
+            "auth_mode": auth_mode,
+            "method": method,
+            "content_type": r.headers.get("content-type", ""),
+            "body_preview": body_preview,
+            "json": parsed if isinstance(parsed, (dict, list)) else None,
+        }
+    except Exception as e:
+        return {"ok": False, "url_tested": url, "auth_mode": auth_mode, "method": method, "error": str(e)}
+
 # -------------------------
 # SAMPLE DATA FOR PREVIEW
 # -------------------------
@@ -686,6 +750,24 @@ with st.sidebar:
     st.caption("Turn this off after your Streamlit secrets are added.")
     repair_estimate = st.number_input("Repair Estimate", min_value=0, value=58000, step=1000)
     min_comps = st.number_input("Minimum comps before fallback", min_value=1, max_value=10, value=3)
+
+    st.divider()
+    st.header("DealRun API Test")
+    st.caption("Temporary tester. Add DEALRUN_API_KEY in Streamlit Secrets first.")
+    dealrun_base = st.selectbox(
+        "Base URL",
+        ["https://api.dealrun.ai", "https://app.dealrun.ai/api", "https://app.dealrun.ai", "https://dealrun.ai/api"],
+        index=0,
+    )
+    dealrun_path = st.text_input("Endpoint path", value="/", help="Try /, /api, /v1, /deals, /comps, /properties, /buyers")
+    dealrun_method = st.selectbox("Method", ["GET", "POST"], index=0)
+    dealrun_auth = st.selectbox("Auth style", ["Bearer token", "X-API-Key", "Token header", "api_key query"], index=0)
+    dealrun_addr = st.text_input("Optional test address", value="1342 Branham Ln #1, San Jose, CA 95118")
+    if st.button("Test DealRun API", use_container_width=True):
+        result = dealrun_request(dealrun_base, dealrun_path, dealrun_method, dealrun_auth, dealrun_addr)
+        st.write("DealRun test result")
+        st.json(result)
+
 
 col1, col2 = st.columns([2, 1])
 with col1:
