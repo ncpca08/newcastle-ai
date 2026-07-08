@@ -1,56 +1,53 @@
-import re
+import json
 import math
-import urllib.parse
+import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import pandas as pd
+import pydeck as pdk
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Newcastle AI Analyzer", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="Newcastle AI Analyzer", layout="wide", page_icon="🏠")
 
-REALIE_BASE = "https://app.realie.ai"
-PROPERTY_SEARCH_PATH = "/api/public/property/search/"
-PREMIUM_COMPS_PATH = "/api/public/premium/comparables/"
+REALIE_BASE = "https://app.realie.ai/api/public"
 
-CITY_COUNTY_MAP = {
-    "stockton": "San Joaquin",
-    "san jose": "Santa Clara",
-    "modesto": "Stanislaus",
-    "fresno": "Fresno",
-    "bakersfield": "Kern",
-    "sacramento": "Sacramento",
-    "manteca": "San Joaquin",
-    "lodi": "San Joaquin",
-    "turlock": "Stanislaus",
-    "merced": "Merced",
-    "visalia": "Tulare",
-    "tulare": "Tulare",
-    "madera": "Madera",
+# Fillout field map placeholder. Replace values with exact Fillout field IDs/names later.
+FILLOUT_FIELD_MAP = {
+    "seller_name": "seller_name",
+    "seller_phone": "seller_phone",
+    "property_address": "property_address",
+    "apn": "apn",
+    "purchase_price": "purchase_price",
+    "buyer_entity": "buyer_entity",
+    "inspection_period": "inspection_period",
+    "closing_period": "closing_period",
+    "escrow_company": "escrow_company",
+    "additional_terms": "additional_terms",
+}
+
+DEFAULT_ESCROW = {
+    "CA": "Chicago Title",
+    "TX": "Title company TBD",
+    "NV": "Title company TBD",
+    "TN": "Title company TBD",
 }
 
 
-# ----------------------------- helpers -----------------------------
-def money(v: Any) -> str:
+def money(v):
     try:
-        if v is None or v == "":
+        if v is None or (isinstance(v, float) and math.isnan(v)):
             return "—"
         return f"${float(v):,.0f}"
     except Exception:
         return "—"
 
-def num(v: Any) -> Optional[float]:
-    try:
-        if v is None or v == "": return None
-        return float(v)
-    except Exception:
-        return None
 
-def fmt_date(raw: Any) -> str:
-    if not raw:
+def fmt_date(v):
+    if not v:
         return "—"
-    s = str(raw)
+    s = str(v)
     try:
         if len(s) == 8 and s.isdigit():
             return datetime.strptime(s, "%Y%m%d").strftime("%m/%d/%Y")
@@ -60,700 +57,508 @@ def fmt_date(raw: Any) -> str:
         pass
     return s
 
-def days_ago(raw: Any) -> Optional[int]:
-    if not raw: return None
+
+def parse_date(v):
+    if not v:
+        return None
+    s = str(v)
     try:
-        s = str(raw)
         if len(s) == 8 and s.isdigit():
-            d = datetime.strptime(s, "%Y%m%d").replace(tzinfo=timezone.utc)
-        else:
-            d = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return max(0, (datetime.now(timezone.utc) - d).days)
-    except Exception:
-        return None
-
-def clean_phone(phone: str) -> str:
-    digits = re.sub(r"\D", "", phone or "")
-    if len(digits) == 11 and digits.startswith("1"):
-        digits = digits[1:]
-    return digits
-
-def contact_links(phone: str, sms_body: str) -> Tuple[str, str]:
-    d = clean_phone(phone)
-    if not d:
-        return "#", "#"
-    tel = f"tel:+1{d}"
-    body = urllib.parse.quote(sms_body or "")
-    sms = f"sms:+1{d}&body={body}"
-    return tel, sms
-
-def parse_address(full: str) -> Dict[str, str]:
-    """Flexible parser for common seller-lead address formats.
-    Handles comma and non-comma formats like:
-    1342 Branham Ln #1, San Jose, CA 95118
-    1409 San Juan Ave Stockton, CA 95203
-    """
-    original = (full or "").strip()
-    text = re.sub(r"\s+", " ", original).strip(" ,")
-    text = re.sub(r"\s*#\s*", " #", text)
-
-    zip_code = ""
-    mzip = re.search(r"\b(\d{5})(?:-\d{4})?\b", text)
-    if mzip:
-        zip_code = mzip.group(1)
-        text = text[:mzip.start()] + text[mzip.end():]
-        text = text.strip(" ,")
-
-    state = "CA"
-    mstate = re.search(r",?\s*([A-Za-z]{2})\s*$", text)
-    if mstate:
-        state = mstate.group(1).upper()
-        text = text[:mstate.start()].strip(" ,")
-
-    parts = [p.strip() for p in text.split(",") if p.strip()]
-    if len(parts) >= 2:
-        street_part = parts[0]
-        city = parts[1]
-    else:
-        street_part = text
-        city = ""
-        low = text.lower()
-        # If no comma before city, pull a known city from the end.
-        for cname in sorted(CITY_COUNTY_MAP.keys(), key=len, reverse=True):
-            if low.endswith(" " + cname) or low == cname:
-                city = cname.title()
-                street_part = text[: len(text) - len(cname)].strip(" ,")
-                break
-
-    unit = ""
-    patterns = [
-        r"(?i)\s+(?:unit|apt|apartment|suite|ste)\s*#?\s*([A-Za-z0-9-]+)\b",
-        r"\s+#\s*([A-Za-z0-9-]+)\b",
-    ]
-    for pat in patterns:
-        m = re.search(pat, street_part)
-        if m:
-            unit = m.group(1)
-            street_part = re.sub(pat, "", street_part).strip()
-            break
-
-    county = CITY_COUNTY_MAP.get(city.lower().strip(), "") if city else ""
-    return {"street": street_part.strip(), "unit": unit.strip(), "city": city.strip(), "state": state, "zip": zip_code, "county": county}
-
-def api_get(path: str, params: Dict[str, Any], label: str) -> Dict[str, Any]:
-    key = st.secrets.get("REALIE_API_KEY", "")
-    if not key:
-        return {"ok": False, "error": "Missing REALIE_API_KEY in Streamlit Secrets."}
-    headers = {"Authorization": key, "Accept": "application/json"}
-    url = REALIE_BASE + path
-    clean_params = {k: v for k, v in params.items() if v not in [None, "", [], {}]}
-    try:
-        r = requests.get(url, headers=headers, params=clean_params, timeout=30)
-        ct = r.headers.get("content-type", "")
-        try:
-            js = r.json()
-        except Exception:
-            js = None
-        return {
-            "ok": r.ok,
-            "status_code": r.status_code,
-            "label": label,
-            "url_tested": url,
-            "params": clean_params,
-            "content_type": ct,
-            "body_preview": r.text[:1500],
-            "json": js,
-        }
-    except Exception as e:
-        return {"ok": False, "label": label, "url_tested": url, "params": clean_params, "error": str(e)}
-
-def identify_property_type(p: Dict[str, Any]) -> str:
-    if p.get("condo") is True:
-        return "condo"
-    # Realie premium endpoint supports any / condo / house. Treat non-condo residential as house for comp search.
-    if p.get("residential") is True:
-        return "house"
-    return "any"
-
-def property_label(t: str) -> str:
-    return {"condo": "Condo", "house": "Single Family / House", "any": "Any"}.get(t, t.title())
-
-def find_subject(properties: List[Dict[str, Any]], unit: str = "") -> Optional[Dict[str, Any]]:
-    if not properties:
-        return None
-    unit_clean = re.sub(r"\D", "", unit or "")
-    if unit_clean:
-        for p in properties:
-            legal = str(p.get("legalDesc", ""))
-            u = str(p.get("unitNumberStripped", ""))
-            if u == unit_clean or re.search(rf"\bUNIT\s+{re.escape(unit_clean)}\b", legal, flags=re.I):
-                return p
-    # Prefer property with modelValue and full data
-    with_avm = [p for p in properties if p.get("modelValue")]
-    return with_avm[0] if with_avm else properties[0]
-
-def subject_search(parsed: Dict[str, str], county: str) -> Dict[str, Any]:
-    # For this API, unit can over-restrict; search without unit and match unit locally.
-    params = {
-        "state": parsed.get("state") or "CA",
-        "address": parsed.get("street"),
-        "residential": "true",
-        "limit": 10,
-        "county": county or None,
-    }
-    if parsed.get("city"):
-        params["city"] = parsed["city"]
-    return api_get(PROPERTY_SEARCH_PATH, params, "Property Search")
-
-def comp_search(lat: float, lon: float, rule: Dict[str, Any], subject_type: str, subject: Dict[str, Any]) -> Dict[str, Any]:
-    sqft = int(num(subject.get("livingArea") or subject.get("buildingArea")) or 0)
-    beds = int(num(subject.get("totalBedrooms")) or 0)
-    baths = int(num(subject.get("totalBathrooms")) or 0)
-    params = {
-        "latitude": str(lat),
-        "longitude": str(lon),
-        "radius": rule["radius"],
-        "timeFrame": rule["months"],
-        "maxResults": 25,
-        "propertyType": rule.get("propertyType", subject_type),
-    }
-    if rule.get("sqft") and sqft:
-        params["sqftMin"] = max(0, sqft - 300)
-        params["sqftMax"] = sqft + 300
-    if rule.get("beds") and beds:
-        params["bedsMin"] = beds
-        params["bedsMax"] = beds
-    if rule.get("baths") and baths:
-        params["bathsMin"] = baths
-        params["bathsMax"] = baths
-    return api_get(PREMIUM_COMPS_PATH, params, f"Comps: {rule['label']}")
-
-def parse_dt(raw: Any) -> Optional[datetime]:
-    if not raw:
-        return None
-    try:
-        s = str(raw)
-        if len(s) == 8 and s.isdigit():
-            return datetime.strptime(s, "%Y%m%d").replace(tzinfo=timezone.utc)
+            return datetime.strptime(s, "%Y%m%d")
         if "T" in s:
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
     except Exception:
         return None
     return None
 
-def best_sale(c: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the best actual sale event from Realie.
-    Preference is recorded purchase sale date + transfer price, then grant deed transfers.
-    This avoids using non-sale/intra-family transfer dates as the comp sold date when a true sale date exists.
-    """
-    candidates = []
 
-    def add(price, date, doc_type="", source="", verified=False):
-        p = num(price)
-        d = parse_dt(date)
-        if not p or p < 10000 or not d:
-            return
-        candidates.append({
-            "price": p,
-            "date_raw": date,
-            "date_obj": d,
-            "doc_type": doc_type or "—",
-            "source": source,
-            "verified": verified,
-        })
-
-    # Best source when available: purchaseSaleDate is the contract/sale date; transferPrice is the recorded sale price.
-    add(c.get("transferPrice"), c.get("purchaseSaleDate"), c.get("saleDocumentTypeLastSale") or c.get("transferDocType"), "purchaseSaleDate + transferPrice", True)
-    add(c.get("salePriceLastTransfer"), c.get("purchaseSaleDate"), c.get("saleDocumentTypeLastSale"), "purchaseSaleDate + salePriceLastTransfer", True)
-
-    # Next: recorded grant deed style transfers. Avoid making IT/QC transfers primary unless no better sale exists.
-    for tr in c.get("transfers") or []:
-        doc = str(tr.get("transferDocType") or c.get("transferDocType") or "").upper()
-        is_sale_doc = doc in {"GD", "WD", "DEED", "GRANT DEED"}
-        add(tr.get("transferPrice"), tr.get("transferDateObject") or tr.get("transferDate"), doc, "transfers[]", is_sale_doc)
-
-    add(c.get("transferPrice"), c.get("transferDateObject") or c.get("transferDate"), c.get("transferDocType"), "top-level transfer", False)
-    add(c.get("pastPriceSale"), c.get("priorSalesDate") or c.get("pastRecoDateSale"), c.get("pastDocumentTypeSale"), "prior sale", True)
-
-    if not candidates:
-        return {"price": None, "date_raw": None, "date_obj": None, "doc_type": "—", "source": "none", "verified": False}
-
-    # Prefer verified sale events, then newest.
-    candidates.sort(key=lambda x: (1 if x["verified"] else 0, x["date_obj"]), reverse=True)
-    return candidates[0]
-
-def sale_price(c: Dict[str, Any]) -> Optional[float]:
-    return best_sale(c).get("price")
-
-def sale_date(c: Dict[str, Any]) -> Any:
-    return best_sale(c).get("date_raw")
-
-def buyer_name(c: Dict[str, Any]) -> str:
-    return c.get("grantee") or c.get("ownerName") or "—"
-
-def haversine(lat1, lon1, lat2, lon2) -> Optional[float]:
+def safe_float(v, default=None):
     try:
-        R = 3958.8
-        phi1, phi2 = math.radians(float(lat1)), math.radians(float(lat2))
-        dphi = math.radians(float(lat2) - float(lat1))
-        dl = math.radians(float(lon2) - float(lon1))
-        a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dl / 2) ** 2
-        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        if v in [None, "", "—"]:
+            return default
+        return float(v)
     except Exception:
+        return default
+
+
+def normalize_address(full):
+    raw = (full or "").strip()
+    raw = re.sub(r"\s+", " ", raw)
+    unit = ""
+    m = re.search(r"(?:#|unit\s+|apt\s+|apartment\s+|ste\s+)([A-Za-z0-9-]+)", raw, flags=re.I)
+    if m:
+        unit = m.group(1).strip()
+        raw = re.sub(r"\s*(?:#|unit\s+|apt\s+|apartment\s+|ste\s+)[A-Za-z0-9-]+", "", raw, flags=re.I)
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    street = parts[0] if parts else raw
+    city = parts[1] if len(parts) > 1 else ""
+    state = "CA"
+    zip_code = ""
+    if len(parts) > 2:
+        m2 = re.search(r"\b([A-Z]{2})\b\s*(\d{5})?", parts[2], flags=re.I)
+        if m2:
+            state = m2.group(1).upper()
+            zip_code = m2.group(2) or ""
+    street = street.replace(" Ln", " Lane").replace(" LN", " Lane")
+    street = street.replace(" Ave", " Avenue").replace(" AVE", " Avenue")
+    street = street.replace(" Dr", " Drive").replace(" DR", " Drive")
+    street = street.replace(" St", " Street").replace(" ST", " Street")
+    return {"street": street.strip(), "unit": unit, "city": city, "state": state, "zip": zip_code}
+
+
+def realie_headers():
+    key = st.secrets.get("REALIE_API_KEY", "")
+    return {"Authorization": key, "Content-Type": "application/json"}
+
+
+def realie_get(path, params):
+    url = f"{REALIE_BASE}{path}"
+    r = requests.get(url, headers=realie_headers(), params=params, timeout=30)
+    try:
+        js = r.json()
+    except Exception:
+        js = {"raw": r.text[:2000]}
+    return r.status_code, url, js
+
+
+def find_subject(address_text, overrides=None):
+    parsed = normalize_address(address_text)
+    if overrides:
+        parsed.update({k: v for k, v in overrides.items() if v})
+    base_params = {
+        "state": parsed.get("state") or "CA",
+        "address": parsed.get("street"),
+        "residential": "true",
+        "limit": 25,
+    }
+    if parsed.get("unit"):
+        base_params["unitNumberStripped"] = parsed["unit"]
+    if parsed.get("city"):
+        base_params["city"] = parsed["city"]
+    if overrides and overrides.get("county"):
+        base_params["county"] = overrides["county"]
+
+    attempts = [base_params.copy()]
+    # fallback without unit, then with city omitted
+    p2 = base_params.copy(); p2.pop("unitNumberStripped", None); attempts.append(p2)
+    p3 = p2.copy(); p3.pop("city", None); attempts.append(p3)
+
+    last = None
+    for params in attempts:
+        code, url, js = realie_get("/property/search/", params)
+        last = (code, url, params, js)
+        props = js.get("properties") or js.get("data") or js.get("results") or []
+        if isinstance(props, dict):
+            props = [props]
+        if props:
+            # prefer unit match if requested
+            unit = parsed.get("unit")
+            if unit:
+                for p in props:
+                    if str(p.get("unitNumberStripped", "")).lower() == str(unit).lower() or f"UNIT {unit}" in str(p.get("legalDesc", "")).upper():
+                        return p, last, parsed
+            return props[0], last, parsed
+    return None, last, parsed
+
+
+def prop_type(prop):
+    if prop.get("condo"):
+        return "condo"
+    # crude multifamily hints
+    uc = str(prop.get("useCode", ""))
+    legal = str(prop.get("legalDesc", "")).lower()
+    if "duplex" in legal:
+        return "duplex"
+    return "house"
+
+
+def best_sale(comp):
+    transfers = comp.get("transfers") or []
+    candidates = []
+    for t in transfers:
+        price = safe_float(t.get("transferPrice"), 0)
+        dt = parse_date(t.get("transferDateObject") or t.get("transferDate"))
+        doc = str(t.get("transferDocType", "")).upper()
+        if price and price > 10000 and dt and doc not in {"IT", "QC"}:
+            candidates.append((dt, price, t))
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][0], candidates[0][1], candidates[0][2]
+    for price_key, date_key in [("transferPrice", "transferDateObject"), ("salePriceLastTransfer", "transferDateObject"), ("pastPriceSale", "priorSalesDate")]:
+        price = safe_float(comp.get(price_key), 0)
+        dt = parse_date(comp.get(date_key))
+        if price and price > 10000 and dt:
+            return dt, price, {}
+    return None, None, {}
+
+
+def months_ago(dt):
+    if not dt:
+        return 9999
+    now = datetime.utcnow()
+    return (now.year - dt.year) * 12 + (now.month - dt.month)
+
+
+def distance_miles(lat1, lon1, lat2, lon2):
+    if None in [lat1, lon1, lat2, lon2]:
         return None
+    R = 3958.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2-lat1)
+    dlambda = math.radians(lon2-lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return 2*R*math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-def comp_score(c: Dict[str, Any], subj: Dict[str, Any], subject_type: str) -> int:
+
+def get_comps(subject, min_needed=3):
+    lat = safe_float(subject.get("latitude"))
+    lon = safe_float(subject.get("longitude"))
+    sqft = safe_float(subject.get("livingArea") or subject.get("buildingArea"), 0)
+    beds = int(safe_float(subject.get("totalBedrooms"), 0) or 0)
+    baths = int(safe_float(subject.get("totalBathrooms"), 0) or 0)
+    ptype = prop_type(subject)
+    params_list = [
+        {"radius": 0.5, "timeFrame": 6, "propertyType": ptype, "sqftMin": max(0, sqft-300), "sqftMax": sqft+300, "bedsMin": beds, "bedsMax": beds, "bathsMin": baths, "bathsMax": baths},
+        {"radius": 1.0, "timeFrame": 12, "propertyType": ptype, "sqftMin": max(0, sqft-300), "sqftMax": sqft+300, "bedsMin": beds, "bedsMax": beds, "bathsMin": baths, "bathsMax": baths},
+        {"radius": 1.0, "timeFrame": 18, "propertyType": "any", "sqftMin": max(0, sqft-300), "sqftMax": sqft+300, "bedsMin": beds, "bedsMax": beds, "bathsMin": baths, "bathsMax": baths},
+        {"radius": 2.0, "timeFrame": 24, "propertyType": "any", "sqftMin": max(0, sqft-400), "sqftMax": sqft+400},
+    ]
+    all_comps = []
+    used_rule = ""
+    debug = []
+    for rule in params_list:
+        params = {"latitude": lat, "longitude": lon, "maxResults": 50, **rule}
+        code, url, js = realie_get("/premium/comparables/", params)
+        debug.append({"status": code, "url": url, "params": params, "preview": str(js)[:500]})
+        comps = js.get("comparables") or []
+        if comps:
+            all_comps.extend(comps)
+            used_rule = f"{rule.get('radius')} mi / {rule.get('timeFrame')} mo / {rule.get('propertyType')} / ±{int((rule.get('sqftMax', sqft)-sqft) if sqft else 0)} sqft"
+        if len(all_comps) >= min_needed * 2:
+            break
+    # dedupe by parcel + sale price/date if possible
+    dedup = {}
+    for c in all_comps:
+        dt, price, _ = best_sale(c)
+        key = (c.get("parcelId"), fmt_date(dt.isoformat() if dt else None), int(price or 0))
+        dedup[key] = c
+    comps = list(dedup.values())
+    return comps, used_rule or "No rule returned comps", debug
+
+
+def score_comp(subject, comp):
+    s_sqft = safe_float(subject.get("livingArea") or subject.get("buildingArea"), 0)
+    c_sqft = safe_float(comp.get("livingArea") or comp.get("buildingArea"), 0)
+    s_beds = safe_float(subject.get("totalBedrooms"), 0)
+    c_beds = safe_float(comp.get("totalBedrooms"), 0)
+    s_baths = safe_float(subject.get("totalBathrooms"), 0)
+    c_baths = safe_float(comp.get("totalBathrooms"), 0)
+    s_year = safe_float(subject.get("yearBuilt"), 0)
+    c_year = safe_float(comp.get("yearBuilt"), 0)
+    dist = distance_miles(safe_float(subject.get("latitude")), safe_float(subject.get("longitude")), safe_float(comp.get("latitude")), safe_float(comp.get("longitude"))) or 9
+    dt, price, _ = best_sale(comp)
+    age_m = months_ago(dt)
     score = 0
-    # property type lock / match
-    if subject_type == "condo" and c.get("condo") is True:
-        score += 30
-    elif subject_type == "house" and c.get("condo") is not True:
-        score += 30
-    # subdivision/tract
-    if c.get("subdivision") and c.get("subdivision") == subj.get("subdivision"):
-        score += 25
-    elif c.get("tractNum") and c.get("tractNum") == subj.get("tractNum"):
-        score += 15
-    # beds baths
-    if c.get("totalBedrooms") == subj.get("totalBedrooms"):
-        score += 15
-    if c.get("totalBathrooms") == subj.get("totalBathrooms"):
-        score += 10
-    # sqft similarity
-    s = num(subj.get("livingArea") or subj.get("buildingArea")) or 0
-    cs = num(c.get("livingArea") or c.get("buildingArea")) or 0
-    if s and cs:
-        diff = abs(s - cs)
-        if diff <= 50: score += 20
-        elif diff <= 150: score += 15
-        elif diff <= 300: score += 10
-        elif diff <= 500: score += 5
-    # recency
-    da = days_ago(sale_date(c))
-    if da is not None:
-        if da <= 180: score += 20
-        elif da <= 365: score += 15
-        elif da <= 545: score += 10
-        else: score += 5
-    # distance
-    d = haversine(subj.get("latitude"), subj.get("longitude"), c.get("latitude"), c.get("longitude"))
-    if d is not None:
-        if d <= .25: score += 20
-        elif d <= .5: score += 15
-        elif d <= 1: score += 10
-        elif d <= 2: score += 5
-    # year built
-    y = num(subj.get("yearBuilt")); cy = num(c.get("yearBuilt"))
-    if y and cy:
-        if abs(y - cy) <= 5: score += 10
-        elif abs(y - cy) <= 15: score += 5
-    return min(score, 150)
+    if prop_type(subject) == prop_type(comp): score += 25
+    if c_beds == s_beds: score += 15
+    if c_baths == s_baths: score += 10
+    if s_sqft and c_sqft:
+        diff = abs(c_sqft - s_sqft)
+        score += max(0, 20 - (diff / 15))
+    if s_year and c_year:
+        score += max(0, 10 - abs(c_year - s_year) / 2)
+    score += max(0, 20 - dist * 15)
+    score += max(0, 20 - age_m * 1.5)
+    # same subdivision / legal tract boost
+    if subject.get("subdivision") and subject.get("subdivision") == comp.get("subdivision"):
+        score += 20
+    return round(min(100, score), 0)
 
-def build_comp_rows(comps: List[Dict[str, Any]], subject: Dict[str, Any], subject_type: str) -> List[Dict[str, Any]]:
+
+def comp_rows(subject, comps):
     rows = []
-    seen = set()
-    subj_parcel = subject.get("parcelId")
     for c in comps:
-        sale = best_sale(c)
-        price = sale.get("price")
-        sqft = num(c.get("livingArea") or c.get("buildingArea"))
-        if not price or not sqft:
+        dt, price, sale = best_sale(c)
+        if not price or not dt:
             continue
-        if c.get("parcelId") == subj_parcel:
-            continue
-        # strict type lock: no condo/SFR mixing
-        if subject_type == "condo" and c.get("condo") is not True:
-            continue
-        if subject_type == "house" and c.get("condo") is True:
-            continue
-        key = (c.get("parcelId"), round(price), fmt_date(sale.get("date_raw")))
-        if key in seen:
-            continue
-        seen.add(key)
-        dist = haversine(subject.get("latitude"), subject.get("longitude"), c.get("latitude"), c.get("longitude"))
-        score = comp_score(c, subject, subject_type)
+        sqft = safe_float(c.get("livingArea") or c.get("buildingArea"), 0)
+        dist = distance_miles(safe_float(subject.get("latitude")), safe_float(subject.get("longitude")), safe_float(c.get("latitude")), safe_float(c.get("longitude")))
+        buyer = c.get("grantee") or c.get("ownerName") or "—"
         rows.append({
-            "raw": c,
-            "sale": sale,
-            "Address": c.get("addressFull") or c.get("addressUnit") or c.get("address") or c.get("addressRaw") or "—",
-            "Sold Date": fmt_date(sale.get("date_raw")),
-            "Sold Date Obj": sale.get("date_obj"),
+            "Address": c.get("addressFullUSPS") or c.get("addressFull") or c.get("addressRaw") or "—",
+            "Sold Date": fmt_date(dt.isoformat()),
+            "_sold_dt": dt,
             "Sold Price": price,
             "$/SF": price / sqft if sqft else None,
-            "SqFt": int(sqft) if sqft else None,
+            "SqFt": sqft,
             "Beds": c.get("totalBedrooms"),
             "Baths": c.get("totalBathrooms"),
             "Distance": dist,
-            "Buyer / Current Owner": buyer_name(c),
-            "Sale Source": sale.get("source"),
-            "Verified Sale": "Yes" if sale.get("verified") else "Review",
-            "Match": score,
+            "Buyer / Current Owner": buyer,
+            "Match": score_comp(subject, c),
+            "_raw": c,
         })
-    # Display order should be newest sold comp first. ARV uses a separate score-weighted calculation.
-    rows.sort(key=lambda r: (r["Sold Date Obj"] or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+    rows.sort(key=lambda r: r["_sold_dt"], reverse=True)
     return rows
 
-def sort_for_arv(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return sorted(rows, key=lambda r: (-r["Match"], r["Distance"] if r["Distance"] is not None else 99))
 
-def arv_tiers(rows: List[Dict[str, Any]], subject: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    sqft = num(subject.get("livingArea") or subject.get("buildingArea"))
-    if not sqft:
-        mv = num(subject.get("modelValue"))
-        return (mv * .95 if mv else None, mv, mv * 1.05 if mv else None)
-    vals = []
-    for r in sort_for_arv(rows)[:10]:
-        ppsf = r.get("$/SF")
-        if ppsf:
-            vals.append(ppsf * sqft)
-    if not vals:
-        mv = num(subject.get("modelValue"))
-        return (mv * .95 if mv else None, mv, mv * 1.05 if mv else None)
-    vals = sorted(vals)
-    def pct(p):
-        idx = int(round((len(vals)-1) * p))
-        return vals[idx]
-    expected = weighted_arv(rows, subject) or sum(vals)/len(vals)
-    return pct(.25), expected, pct(.75)
-
-def weighted_arv(rows: List[Dict[str, Any]], subject: Dict[str, Any]) -> Optional[float]:
-    if not rows: return None
-    sqft = num(subject.get("livingArea") or subject.get("buildingArea"))
-    if not sqft: return None
-    top = sort_for_arv(rows)[:6]
-    weights = []
-    vals = []
-    for r in top:
-        ppsf = r.get("$/SF") or 0
-        w = max(1, r.get("Match", 0))
-        vals.append(ppsf * sqft * w)
-        weights.append(w)
-    return sum(vals) / sum(weights) if weights else None
+def arv_tiers(rows):
+    if not rows:
+        return None
+    scored = sorted(rows, key=lambda r: r["Match"], reverse=True)
+    top = scored[:min(6, len(scored))]
+    prices = [r["Sold Price"] for r in top if r.get("Sold Price")]
+    if not prices:
+        return None
+    expected = sum(prices) / len(prices)
+    conservative = sorted(prices)[max(0, int(len(prices)*0.25)-1)] if len(prices) >= 4 else min(prices)
+    aggressive = sorted(prices)[min(len(prices)-1, int(len(prices)*0.75))] if len(prices) >= 4 else max(prices)
+    conf = int(min(98, 55 + len(top)*5 + sum([r["Match"] for r in top])/len(top)*0.15))
+    return {"quick_sale": conservative, "market": expected, "premium": aggressive, "confidence": conf, "used": top}
 
 
-# ----------------------------- auth + lead queue -----------------------------
-def get_users() -> Dict[str, Any]:
+def tel_link(phone):
+    digits = re.sub(r"\D", "", phone or "")
+    return f"tel:{digits}" if digits else "#"
+
+
+def sms_link(phone, msg):
+    digits = re.sub(r"\D", "", phone or "")
+    return f"sms:{digits}&body={quote(msg or '')}" if digits else "#"
+
+
+def require_login():
     users = st.secrets.get("users", {})
-    try:
-        return dict(users)
-    except Exception:
-        return {}
-
-def login_gate() -> Tuple[str, str]:
-    users = get_users()
-    if "auth_user" in st.session_state:
-        return st.session_state["auth_user"], st.session_state.get("auth_role", "admin")
-
-    # Do not lock the owner out before Secrets are configured.
-    if not users:
-        st.session_state["auth_user"] = "Marco"
-        st.session_state["auth_role"] = "admin"
-        return "Marco", "admin"
-
+    if "auth" not in st.session_state:
+        st.session_state.auth = None
+    if st.session_state.auth:
+        return st.session_state.auth
     st.title("🏠 Newcastle AI Login")
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
-    if st.button("Log in", type="primary"):
-        ukey = username.strip().lower()
-        rec = users.get(ukey)
-        if rec and str(rec.get("password", "")) == password:
-            st.session_state["auth_user"] = rec.get("name", username.strip().title())
-            st.session_state["auth_role"] = rec.get("role", "va")
+    if st.button("Login", use_container_width=True):
+        if username in users and password == users[username].get("password"):
+            st.session_state.auth = {"username": username, "role": users[username].get("role", "va")}
             st.rerun()
         else:
-            st.error("Invalid login.")
+            st.error("Invalid login")
     st.stop()
+
 
 def seed_leads():
     if "leads" not in st.session_state:
-        st.session_state["leads"] = []
-
-def add_lead(name: str, phone: str, address: str, source: str, assigned: str = "Unassigned"):
-    seed_leads()
-    st.session_state["leads"].append({
-        "id": f"L{len(st.session_state['leads'])+1:04d}",
-        "name": name or "Unknown Seller",
-        "phone": clean_phone(phone),
-        "address": address,
-        "source": source or "Manual",
-        "status": "New",
-        "assigned": assigned,
-        "locked_by": "",
-        "notes": "",
-        "created": datetime.now().strftime("%m/%d/%Y %I:%M %p"),
-    })
-
-def status_icon(status: str) -> str:
-    return {"New":"🔴", "In Progress":"🟠", "Follow Up":"🟡", "Hot":"🟢", "Offer Made":"🔵", "Dead":"⚫"}.get(status, "⚪")
-
-def render_lead_queue(current_user: str, role: str):
-    seed_leads()
-    st.header("Lead Queue")
-    st.caption("Temporary in-app queue. Next phase: sync this with Zoho Bigin so it becomes shared and persistent.")
-    with st.expander("Add lead manually", expanded=False):
-        c1, c2 = st.columns(2)
-        name = c1.text_input("Seller name", key="new_lead_name")
-        phone = c2.text_input("Phone", key="new_lead_phone")
-        addr = st.text_input("Property address", key="new_lead_addr")
-        c3, c4 = st.columns(2)
-        source = c3.selectbox("Source", ["SMS", "Email", "Website", "Referral", "Manual"], key="new_lead_source")
-        assigned = c4.selectbox("Assigned to", ["Unassigned", "Marco", "Doreen"], key="new_lead_assigned")
-        if st.button("Add to Queue"):
-            add_lead(name, phone, addr, source, assigned)
-            st.rerun()
-
-    leads = st.session_state["leads"]
-    if not leads:
-        st.info("No leads in the queue yet.")
-        return
-    counts = {s: sum(1 for l in leads if l["status"] == s) for s in ["New", "In Progress", "Follow Up", "Hot", "Offer Made", "Dead"]}
-    cols = st.columns(6)
-    for col, sname in zip(cols, counts):
-        col.metric(f"{status_icon(sname)} {sname}", counts[sname])
-
-    for i, lead in enumerate(leads):
-        title = f"{status_icon(lead['status'])} {lead['name']} — {lead['address']} — {lead['status']}"
-        with st.expander(title, expanded=lead["status"] in ["New", "Hot"]):
-            c1, c2, c3 = st.columns([1,1,1])
-            c1.write(f"**Source:** {lead['source']}")
-            c1.write(f"**Created:** {lead['created']}")
-            c2.write(f"**Assigned:** {lead['assigned']}")
-            c2.write(f"**Worked by:** {lead['locked_by'] or '—'}")
-            c3.write(f"**Phone:** {lead['phone'] or '—'}")
-            c3.write(f"**Lead ID:** {lead['id']}")
-
-            cc1, cc2, cc3 = st.columns(3)
-            new_status = cc1.selectbox("Status", ["New", "In Progress", "Follow Up", "Hot", "Offer Made", "Dead"], index=["New", "In Progress", "Follow Up", "Hot", "Offer Made", "Dead"].index(lead["status"]), key=f"status_{i}")
-            new_assigned = cc2.selectbox("Assigned", ["Unassigned", "Marco", "Doreen"], index=["Unassigned", "Marco", "Doreen"].index(lead["assigned"]) if lead["assigned"] in ["Unassigned", "Marco", "Doreen"] else 0, key=f"assigned_{i}")
-            if cc3.button("I'm working this", key=f"lock_{i}"):
-                lead["locked_by"] = current_user
-                lead["status"] = "In Progress"
-                st.rerun()
-            lead["status"] = new_status
-            lead["assigned"] = new_assigned
-            lead["notes"] = st.text_area("Notes", value=lead.get("notes", ""), key=f"notes_{i}")
-            d = clean_phone(lead.get("phone", ""))
-            msg = urllib.parse.quote(f"Hi {lead['name']}, this is Marco with Newcastle Partners. I was reaching out about {lead['address']}. Are you still open to selling?")
-            if d:
-                st.markdown(f"[📞 Call](tel:+1{d}) &nbsp;&nbsp; [💬 SMS](sms:+1{d}&body={msg})", unsafe_allow_html=True)
-            if st.button("Load in Analyzer", key=f"load_{i}"):
-                st.session_state["address_input"] = lead["address"]
-                st.session_state["seller_phone"] = lead["phone"]
-                st.session_state["seller_name"] = lead["name"]
-                st.rerun()
-
-# ----------------------------- UI -----------------------------
-st.markdown("""
-<style>
-.stApp { background: #0d1117; }
-[data-testid="stSidebar"] { background: #2b2c35; }
-.metric-card {background:#111827; border:1px solid #22314a; border-radius:16px; padding:18px; min-height:105px;}
-.metric-label {font-size:13px; color:#cbd5e1; font-weight:600;}
-.metric-value {font-size:30px; color:#f8fafc; font-weight:700; margin-top:8px;}
-.good-pill {background:#153b2a; color:#65d68b; border-radius:10px; padding:10px 14px; font-weight:700;}
-.note-box {background:#111827; border:1px solid #22314a; border-radius:16px; padding:18px;}
-</style>
-""", unsafe_allow_html=True)
-
-current_user, current_role = login_gate()
-
-with st.sidebar:
-    st.title("Settings")
-    st.caption(f"Logged in as: {current_user} ({current_role})")
-    if st.button("Log out"):
-        for k in ["auth_user", "auth_role"]:
-            st.session_state.pop(k, None)
-        st.rerun()
-    repair_estimate = st.number_input("Repair Estimate", min_value=0, value=58000, step=1000)
-    min_comps = st.number_input("Minimum comps before fallback", min_value=1, max_value=10, value=3, step=1)
-    show_diag = st.toggle("Show API diagnostics", value=False) if current_role == "admin" else False
-    st.divider()
-    st.subheader("Contact Actions")
-    st.caption("Marco can use Apple/Mac tel/sms links now. Doreen's calling provider can be connected later.")
-
-st.title("🏠 Newcastle AI Acquisition Analyzer")
-st.caption("Realie-powered V7: login + lead queue + smart parsing + verified comps + weighted ARV")
-
-tab_analyzer, tab_queue = st.tabs(["Property Analyzer", "Lead Queue"])
-
-with tab_queue:
-    render_lead_queue(current_user, current_role)
-
-with tab_analyzer:
-    col1, col2 = st.columns([2.2, 1])
-    with col1:
-        address_input = st.text_input("Property Address", value=st.session_state.get("address_input", "1342 Branham Ln #1, San Jose, CA 95118"), key="address_input_box")
-        parsed_default = parse_address(address_input)
-        with st.expander("Address details / override", expanded=False):
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                street = st.text_input("Street address only", value=parsed_default["street"])
-            with c2:
-                unit = st.text_input("Unit only", value=parsed_default["unit"])
-            c3, c4, c5 = st.columns([1, .5, 1])
-            with c3:
-                city = st.text_input("City", value=parsed_default["city"])
-            with c4:
-                state = st.text_input("State", value=parsed_default["state"] or "CA")
-            with c5:
-                county = st.text_input("County", value=parsed_default.get("county", ""))
-        seller_name = st.text_input("Seller Name", value=st.session_state.get("seller_name", ""))
-        seller_phone = st.text_input("Seller Phone (optional, for Call/SMS buttons)", value=st.session_state.get("seller_phone", ""))
-        photo_link = st.text_input("Dropbox / Google Drive Photo Link", value="")
-    with col2:
-        st.write("Upload Property Photos")
-        st.file_uploader("Upload", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True, label_visibility="collapsed")
-        st.caption("200MB per file • PNG, JPG, WEBP")
-
-    street_for_msg = street or parsed_default.get("street", "the property")
-    sms_template = "Hi {seller_name}, this is Marco with Newcastle Partners. I was reaching out about {street_address}. Are you still open to selling?"
-    sms_msg = st.text_input("SMS message", value=sms_template.format(seller_name=seller_name or "there", street_address=street_for_msg))
-    tel_link, sms_link = contact_links(seller_phone, sms_msg)
-    if clean_phone(seller_phone):
-        st.markdown(f"[📞 Call Seller]({tel_link}) &nbsp;&nbsp; [💬 SMS Seller]({sms_link})", unsafe_allow_html=True)
-
-    analyze = st.button("Analyze Property", type="primary", use_container_width=True)
-
-if analyze:
-    parsed = {"street": street.strip(), "unit": unit.strip(), "city": city.strip(), "state": state.strip() or "CA", "zip": parsed_default.get("zip", "")}
-    with st.status("Analyzing property with Realie...", expanded=True) as status:
-        st.write("Searching subject property...")
-        prop_resp = subject_search(parsed, county.strip())
-        if show_diag:
-            st.json(prop_resp)
-        props = (((prop_resp.get("json") or {}).get("properties")) or []) if prop_resp.get("ok") else []
-        subject = find_subject(props, parsed.get("unit"))
-        if not subject:
-            status.update(label="Property not found", state="error")
-            st.error("Property not found. Check the parsed Street/City/County fields under Address details. County can be left blank if unsure.")
-            st.stop()
-        st.write("Property found.")
-        subject_type = identify_property_type(subject)
-        lat = num(subject.get("latitude")); lon = num(subject.get("longitude"))
-        if lat is None or lon is None:
-            status.update(label="Missing coordinates", state="error")
-            st.error("Subject found, but no latitude/longitude returned.")
-            st.stop()
-        st.write("Finding comparable sales...")
-        rules = [
-            {"label": "Ideal: 0.5 mi / 6 mo / same type / same bed-bath / ±300 sqft", "radius": 0.5, "months": 6, "sqft": True, "beds": True, "baths": True, "propertyType": "any"},
-            {"label": "Strong: 1.0 mi / 6 mo / same type / same bed-bath / ±300 sqft", "radius": 1.0, "months": 6, "sqft": True, "beds": True, "baths": True, "propertyType": "any"},
-            {"label": "Standard: 1.0 mi / 12 mo / same type / same bed-bath / ±300 sqft", "radius": 1.0, "months": 12, "sqft": True, "beds": True, "baths": True, "propertyType": "any"},
-            {"label": "Backup: 1.0 mi / 12 mo / same type / ±300 sqft", "radius": 1.0, "months": 12, "sqft": True, "beds": False, "baths": False, "propertyType": "any"},
+        st.session_state.leads = [
+            {"id": 1, "address": "1409 San Juan Ave, Stockton, CA 95203", "seller": "", "phone": "8183004227", "status": "New", "assigned": "Unassigned", "notes": "", "lat": None, "lon": None},
         ]
-        all_comps = []
-        successful_labels = []
-        for rule in rules:
-            resp = comp_search(lat, lon, rule, subject_type, subject)
-            if show_diag:
-                st.write(rule["label"]); st.json(resp)
-            comps = (((resp.get("json") or {}).get("comparables")) or []) if resp.get("ok") else []
-            if comps:
-                all_comps.extend(comps)
-                successful_labels.append(rule["label"])
 
-        best_rows = build_comp_rows(all_comps, subject, subject_type)
-        rule_used = {"label": "Verified sweep: newest sales first; same property type locked; ±300 sqft preferred; 6 mo first, 12 mo backup"}
-        status.update(label="Analysis complete", state="complete")
 
-    # Subject Summary
-    st.subheader("Subject Property")
-    cols = st.columns(6)
-    data = [
-        ("Property Type", property_label(subject_type)),
-        ("Beds", subject.get("totalBedrooms") or "—"),
-        ("Baths", subject.get("totalBathrooms") or "—"),
-        ("House SqFt", subject.get("livingArea") or subject.get("buildingArea") or "—"),
-        ("Lot SqFt", subject.get("lotSizeArea") or "—"),
-        ("Year Built", subject.get("yearBuilt") or "—"),
-    ]
-    for c, (lab, val) in zip(cols, data):
-        c.markdown(f'<div class="metric-card"><div class="metric-label">{lab}</div><div class="metric-value">{val}</div></div>', unsafe_allow_html=True)
-    st.caption(f"Owner: {subject.get('ownerName','—')} | Parcel: {subject.get('parcelId','—')} | Legal: {subject.get('legalDesc','—')}")
+def lead_queue(user):
+    seed_leads()
+    st.header("📥 Lead Queue")
+    status_colors = {"New": "🔴", "In Progress": "🟠", "Follow Up": "🟡", "Hot": "🟢", "Under Contract": "🔵", "Dead": "⚫"}
+    with st.expander("Add Lead", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            addr = st.text_input("Lead address", key="new_lead_addr")
+            seller = st.text_input("Seller name", key="new_lead_seller")
+        with c2:
+            phone = st.text_input("Phone", key="new_lead_phone")
+            assigned = st.selectbox("Assign to", ["Unassigned", "Marco", "Doreen"], key="new_lead_assigned")
+        if st.button("Add to queue"):
+            st.session_state.leads.append({"id": len(st.session_state.leads)+1, "address": addr, "seller": seller, "phone": phone, "status": "New", "assigned": assigned, "notes": "", "lat": None, "lon": None})
+            st.rerun()
+    for lead in st.session_state.leads:
+        with st.container(border=True):
+            c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+            c1.subheader(f"{status_colors.get(lead['status'],'⚪')} {lead['address']}")
+            c1.caption(f"Seller: {lead.get('seller') or '—'} | Assigned: {lead.get('assigned')}")
+            lead["status"] = c2.selectbox("Status", list(status_colors.keys()), index=list(status_colors.keys()).index(lead["status"]), key=f"status_{lead['id']}")
+            lead["assigned"] = c3.selectbox("Assigned", ["Unassigned", "Marco", "Doreen"], index=["Unassigned", "Marco", "Doreen"].index(lead.get("assigned", "Unassigned")), key=f"assigned_{lead['id']}")
+            if c4.button("Analyze", key=f"analyze_{lead['id']}"):
+                st.session_state.property_address = lead["address"]
+                st.session_state.seller_phone = lead.get("phone", "")
+                st.session_state.seller_name = lead.get("seller", "")
+                st.session_state.page = "Analyze Property"
+                st.rerun()
+            lead["notes"] = st.text_area("Notes", value=lead.get("notes", ""), key=f"notes_{lead['id']}")
 
-    conservative_arv, expected_arv, aggressive_arv = arv_tiers(best_rows, subject)
-    arv = conservative_arv or expected_arv or num(subject.get("modelValue"))
-    arv_ranked_rows = sort_for_arv(best_rows)
-    confidence = min(99, max(55, round((sum(r["Match"] for r in arv_ranked_rows[:6]) / max(1, len(arv_ranked_rows[:6])) / 150) * 100))) if best_rows else 55
-    st.subheader("ARV + Offer Matrix")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Conservative ARV", money(conservative_arv))
-    c2.metric("Expected ARV", money(expected_arv))
-    c3.metric("Aggressive ARV", money(aggressive_arv))
-    c4.metric("Confidence", f"{confidence}%")
-    st.caption(f"Comps used for ARV: {min(len(arv_ranked_rows), 6)} | Total verified comps shown: {len(best_rows)} | Rule: {rule_used['label'] if rule_used else '—'}")
 
-    st.markdown("#### Offer Matrix uses Conservative ARV")
-    oc = st.columns(4)
-    for col, pct in zip(oc, [.75, .70, .65, .60]):
-        before = (arv or 0) * pct
-        after = before - repair_estimate
-        col.metric(f"{int(pct*100)}% ARV", money(before), help="Before repairs")
-        col.caption(f"After repairs: {money(after)}")
+def lead_map(subject=None, rows=None):
+    st.header("🗺️ Map View")
+    data = []
+    if subject:
+        data.append({"lat": subject.get("latitude"), "lon": subject.get("longitude"), "label": "Subject", "type": "Subject", "price": None})
+    for r in rows or []:
+        raw = r.get("_raw", {})
+        data.append({"lat": raw.get("latitude"), "lon": raw.get("longitude"), "label": r.get("Address"), "type": "Comp", "price": r.get("Sold Price")})
+    df = pd.DataFrame([d for d in data if d.get("lat") and d.get("lon")])
+    if df.empty:
+        st.info("Analyze a property first to view subject and comps on the map.")
+        return
+    st.pydeck_chart(pdk.Deck(
+        map_style=None,
+        initial_view_state=pdk.ViewState(latitude=float(df["lat"].mean()), longitude=float(df["lon"].mean()), zoom=13, pitch=0),
+        layers=[pdk.Layer("ScatterplotLayer", data=df, get_position="[lon, lat]", get_radius=75, pickable=True)],
+        tooltip={"text": "{type}: {label}\n{price}"}
+    ))
 
-    st.subheader("Comparable Sales")
-    st.caption("Same property type locked. Sorted newest sold first. Buyer/current owner uses grantee first, then ownerName fallback. ARV is calculated from the highest-scoring comps, not simply the first rows shown.")
-    if not best_rows:
-        st.warning("No comps matched after filtering. Try enabling diagnostics or widening the criteria.")
-    else:
+
+def offer_composer(subject, tiers, seller_name, seller_phone, address):
+    st.header("📄 Compose Offer")
+    if not subject or not tiers:
+        st.info("Analyze a property first, then compose an offer.")
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        buyer_entity = st.text_input("Buyer entity", value="Newcastle Partners CA LLC")
+        seller_name = st.text_input("Seller name", value=seller_name or subject.get("ownerName", ""))
+        purchase_price = st.number_input("Purchase price", min_value=0, value=int(tiers["quick_sale"] * 0.75 - st.session_state.get("repair_estimate", 58000)), step=1000)
+        emd = st.number_input("EMD", min_value=0, value=5000, step=500)
+    with c2:
+        inspection = st.selectbox("Inspection period", ["5 days", "7 days", "10 days", "15 days"], index=1)
+        closing = st.selectbox("Closing period", ["7 days", "10 days", "14 days", "21 days", "30 days"], index=2)
+        state = normalize_address(address).get("state", "CA")
+        escrow = st.text_input("Escrow / Title", value=DEFAULT_ESCROW.get(state, "Title company TBD"))
+        additional_terms = st.text_area("Additional terms", value="Buyer to purchase property as-is. Buyer to pay standard buyer closing costs unless otherwise agreed in writing.")
+    payload = {
+        "seller_name": seller_name,
+        "seller_phone": seller_phone,
+        "property_address": address,
+        "apn": subject.get("parcelId") or subject.get("state_parcelId") or "",
+        "purchase_price": purchase_price,
+        "emd": emd,
+        "buyer_entity": buyer_entity,
+        "inspection_period": inspection,
+        "closing_period": closing,
+        "escrow_company": escrow,
+        "additional_terms": additional_terms,
+    }
+    with st.expander("Review offer data before sending", expanded=True):
+        st.json(payload)
+    col1, col2 = st.columns(2)
+    form_url = st.secrets.get("FILLOUT_FORM_URL", "https://newoffer.fillout.com/rpa")
+    col1.link_button("Open Fillout Offer Form", form_url, use_container_width=True)
+    if col2.button("Submit to Fillout API (requires field mapping)", use_container_width=True):
+        api_key = st.secrets.get("FILLOUT_API_KEY", "")
+        form_id = st.secrets.get("FILLOUT_FORM_ID", "")
+        if not api_key or not form_id:
+            st.error("Add FILLOUT_API_KEY and FILLOUT_FORM_ID in Streamlit Secrets first.")
+        else:
+            st.warning("Field mapping must be confirmed before live submission. Use the Review data above to map exact Fillout fields.")
+
+
+def analyze_page(user):
+    st.title("🏠 Newcastle AI Acquisition Analyzer")
+    st.caption("Realie-powered: verified comps → value tiers → purchase guide → offer composer")
+    address = st.text_input("Property Address", value=st.session_state.get("property_address", "1342 Branham Ln #1, San Jose, CA 95118"), key="property_address")
+    with st.expander("Address details / override"):
+        o1, o2, o3, o4 = st.columns(4)
+        street_o = o1.text_input("Street override", value="")
+        unit_o = o2.text_input("Unit override", value="")
+        city_o = o3.text_input("City override", value="")
+        county_o = o4.text_input("County", value="")
+    seller_name = st.text_input("Seller name", value=st.session_state.get("seller_name", ""))
+    seller_phone = st.text_input("Seller Phone", value=st.session_state.get("seller_phone", ""))
+    sms_template = st.text_area("SMS message", value=f"Hi {seller_name or 'there'}, this is Marco with Newcastle Partners. I was reaching out about {normalize_address(address).get('street')}. Are you still open to selling?")
+    if seller_phone:
+        st.markdown(f"[📞 Call Seller]({tel_link(seller_phone)}) &nbsp;&nbsp; [💬 SMS Seller]({sms_link(seller_phone, sms_template)})", unsafe_allow_html=True)
+    uploaded = st.file_uploader("Upload Property Photos", accept_multiple_files=True, type=["png", "jpg", "jpeg", "webp"])
+    if st.button("Analyze Property", type="primary", use_container_width=True):
+        overrides = {"street": street_o, "unit": unit_o, "city": city_o, "county": county_o}
+        with st.spinner("Searching property, pulling comps, ranking ARV..."):
+            subject, req, parsed = find_subject(address, overrides)
+            st.session_state.last_request = req
+            if not subject:
+                st.error("Property not found. Try spelling out Lane/Avenue/Drive or use Address details override.")
+                return
+            comps, rule, debug = get_comps(subject, min_needed=int(st.session_state.get("min_comps", 3)))
+            rows = comp_rows(subject, comps)
+            tiers = arv_tiers(rows)
+            st.session_state.analysis = {"subject": subject, "rows": rows, "tiers": tiers, "rule": rule, "debug": debug}
+    analysis = st.session_state.get("analysis")
+    if analysis:
+        subject = analysis["subject"]; rows = analysis["rows"]; tiers = analysis["tiers"]; rule = analysis["rule"]
+        st.success("Analysis complete")
+        st.header("Subject Property")
+        c = st.columns(6)
+        vals = [("Property Type", prop_type(subject).title()), ("Beds", subject.get("totalBedrooms")), ("Baths", subject.get("totalBathrooms")), ("House SqFt", subject.get("livingArea") or subject.get("buildingArea")), ("Lot SqFt", subject.get("lotSizeArea")), ("Year Built", subject.get("yearBuilt"))]
+        for col, (label, val) in zip(c, vals):
+            col.metric(label, val or "—")
+        st.caption(f"Owner: {subject.get('ownerName','—')} | APN/Parcel: {subject.get('parcelId') or subject.get('state_parcelId') or '—'} | Legal: {subject.get('legalDesc','—')}")
+        if tiers:
+            st.header("📈 Property Value")
+            c = st.columns(4)
+            c[0].metric("Quick Sale Value", money(tiers["quick_sale"]))
+            c[1].metric("Market Value", money(tiers["market"]))
+            c[2].metric("Premium Value", money(tiers["premium"]))
+            c[3].metric("Confidence", f"{tiers['confidence']}%")
+            st.caption(f"Comps used for value: {len(tiers['used'])} | Total verified comps shown: {len(rows)} | Rule: {rule}")
+            st.header("💰 Recommended Purchase Prices")
+            base = tiers["quick_sale"]
+            repair = st.session_state.get("repair_estimate", 58000)
+            labels = [("Wholesale / Light Rehab", .75), ("Fix & Flip", .70), ("Heavy Rehab", .65), ("High Risk", .60)]
+            cols = st.columns(4)
+            for col, (label, pct) in zip(cols, labels):
+                before = base * pct
+                col.metric(label, money(before))
+                col.caption(f"After repairs: {money(before - repair)}")
+        st.header("Comparable Sales")
+        st.caption("Same property type locked. Sorted newest sold first. Buyer/current owner uses grantee first, then ownerName fallback.")
         display = []
-        for r in best_rows[:12]:
+        for r in rows[:50]:
             display.append({
-                "Address": r["Address"],
-                "Sold Date": r["Sold Date"],
-                "Sold Price": money(r["Sold Price"]),
-                "$/SF": money(r["$/SF"]),
-                "SqFt": r["SqFt"],
-                "Beds": r["Beds"],
-                "Baths": r["Baths"],
-                "Distance": f"{r['Distance']:.2f} mi" if r["Distance"] is not None else "—",
-                "Buyer / Current Owner": r["Buyer / Current Owner"],
-                "Verified": r["Verified Sale"],
-                "Match": f"{round((r['Match']/150)*100)}%",
+                "Address": r["Address"], "Sold Date": r["Sold Date"], "Sold Price": money(r["Sold Price"]), "$/SF": money(r["$/SF"]),
+                "SqFt": int(r["SqFt"] or 0), "Beds": r["Beds"], "Baths": r["Baths"], "Distance": f"{r['Distance']:.2f} mi" if r["Distance"] else "—",
+                "Buyer / Current Owner": r["Buyer / Current Owner"], "Match": f"{int(r['Match'])}%"
             })
         st.dataframe(pd.DataFrame(display), use_container_width=True, hide_index=True)
-        st.markdown("### Clickable Comp Details")
-        for i, r in enumerate(best_rows[:8], 1):
-            c = r["raw"]
-            with st.expander(f"{i}. {r['Address']} — {money(r['Sold Price'])} — Match {round((r['Match']/150)*100)}%"):
-                dc1, dc2, dc3 = st.columns(3)
-                dc1.write("**Buyer / Owner**")
-                dc1.write(buyer_name(c))
-                dc1.write("**Mailing Address**")
-                dc1.write(c.get("ownerAddressFull") or "—")
-                dc2.write("**Sale / Transfer**")
-                dc2.write(f"Date: {r['Sold Date']}")
-                dc2.write(f"Price: {money(r['Sold Price'])}")
-                dc2.write(f"Source: {r.get('Sale Source', '—')}")
-                dc2.write(f"Verified: {r.get('Verified Sale', '—')}")
-                dc2.write(f"Doc: {c.get('transferDocType','—')} / {c.get('transferDocNum','—')}")
-                dc3.write("**Property Details**")
-                dc3.write(f"Parcel: {c.get('parcelId','—')}")
-                dc3.write(f"Lender: {c.get('lenderName','—')}")
-                dc3.write(f"Lien Balance: {money(c.get('totalLienBalance'))}")
-                dc3.write(f"Equity Est: {money(c.get('equityCurrentEstBal'))}")
-                maps = urllib.parse.quote(c.get("addressFull") or r["Address"])
-                st.markdown(f"[Map](https://www.google.com/maps/search/?api=1&query={maps})", unsafe_allow_html=True)
+        st.header("Clickable Comp Details")
+        for idx, r in enumerate(rows[:10], start=1):
+            with st.expander(f"{idx}. {r['Address']} — {money(r['Sold Price'])} — Match {int(r['Match'])}%"):
+                raw = r["_raw"]
+                st.write(f"**Buyer / Current Owner:** {r['Buyer / Current Owner']}")
+                st.write(f"**APN/Parcel:** {raw.get('parcelId','—')}")
+                st.write(f"**Mailing Address:** {raw.get('ownerAddressFull','—')}")
+                st.write(f"**Lender:** {raw.get('lenderName','—')}")
+                st.write(f"**Equity Estimate:** {money(raw.get('equityCurrentEstBal'))}")
+                st.write(f"**Transfer Doc:** {raw.get('transferDocType','—')} / {raw.get('transferDocNum','—')}")
+        lead_map(subject, rows)
+        offer_composer(subject, tiers, seller_name, seller_phone, address)
+    if st.session_state.get("show_api_diag", False) and st.session_state.get("last_request"):
+        with st.expander("API diagnostics"):
+            st.json(st.session_state.get("last_request"))
 
-    st.subheader("AI Acquisition Notes")
-    st.markdown(f"""
-<div class="note-box">
-<b>Property type logic:</b> Subject classified as <b>{property_label(subject_type)}</b>. The comp engine locks to the same property type and filters out mismatches.<br><br>
-<b>Comp rule used:</b> {rule_used['label'] if rule_used else 'No comp rule succeeded.'}<br><br>
-<b>Recommended starting point:</b> Use the 70% ARV tier unless buyer demand is extremely strong.<br><br>
-<b>Next step:</b> Review photos, Street View, condition outliers, and buyer demand before making the final offer.
-</div>
-""", unsafe_allow_html=True)
 
-else:
-    st.divider()
-    st.subheader("Quick Call / SMS Launcher")
-    st.caption("Enter any phone number and click Call or SMS. This opens the default phone or Messages app on your Mac/iPhone.")
-    qc1, qc2 = st.columns([1, 2])
-    with qc1:
-        quick_phone = st.text_input("Phone number", value=seller_phone)
-    with qc2:
-        quick_msg = st.text_input("SMS message ", value=sms_msg)
-    qtel, qsms = contact_links(quick_phone, quick_msg)
-    if clean_phone(quick_phone):
-        st.markdown(f"[📞 Call]({qtel}) &nbsp;&nbsp; [💬 SMS]({qsms})", unsafe_allow_html=True)
+def main():
+    user = require_login()
+    with st.sidebar:
+        st.write(f"Logged in: **{user['username']}** ({user['role']})")
+        if st.button("Logout"):
+            st.session_state.auth = None
+            st.rerun()
+        st.divider()
+        st.session_state.page = st.radio("Navigation", ["Dashboard", "Lead Queue", "Analyze Property", "Map"], index=["Dashboard", "Lead Queue", "Analyze Property", "Map"].index(st.session_state.get("page", "Analyze Property")))
+        st.divider()
+        st.session_state.repair_estimate = st.number_input("Repair Estimate", min_value=0, value=int(st.session_state.get("repair_estimate", 58000)), step=1000)
+        st.session_state.min_comps = st.number_input("Minimum comps before fallback", min_value=1, value=int(st.session_state.get("min_comps", 3)), step=1)
+        if user["role"] == "admin":
+            st.session_state.show_api_diag = st.toggle("Show API diagnostics", value=st.session_state.get("show_api_diag", False))
+    if st.session_state.page == "Dashboard":
+        st.title("Dashboard")
+        seed_leads()
+        c = st.columns(4)
+        c[0].metric("New Leads", sum(1 for l in st.session_state.leads if l["status"] == "New"))
+        c[1].metric("In Progress", sum(1 for l in st.session_state.leads if l["status"] == "In Progress"))
+        c[2].metric("Follow Ups", sum(1 for l in st.session_state.leads if l["status"] == "Follow Up"))
+        c[3].metric("Hot Leads", sum(1 for l in st.session_state.leads if l["status"] == "Hot"))
+    elif st.session_state.page == "Lead Queue":
+        lead_queue(user)
+    elif st.session_state.page == "Map":
+        a = st.session_state.get("analysis")
+        lead_map(a.get("subject") if a else None, a.get("rows") if a else None)
+    else:
+        analyze_page(user)
+
+
+if __name__ == "__main__":
+    main()
