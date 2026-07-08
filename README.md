@@ -1,19 +1,22 @@
-# Newcastle AI Acquisition Analyzer
+# Newcastle AI - Realie Analyzer V5
 
-Realie-powered V2 patch.
+Realie-powered acquisition analyzer.
 
-## What changed
-- Main **Analyze Property** now uses Realie Property Search and Premium Comparables.
-- Property type lock: condo-to-condo, house-to-house.
-- Starts with strict comp logic: same type, 0.5 mi, 6 months, ±300 sqft, exact beds/baths.
-- Falls back to 12 months / 1 mile only when needed.
-- Weighted ARV and confidence score.
-- Offer matrix shows 75%, 70%, 65%, 60% ARV and repair-adjusted offers.
-- Quick Call/SMS launcher using `tel:` and `sms:` links.
+## Streamlit Secrets
 
-## Required Streamlit Secret
+Add your Realie key:
+
 ```toml
-REALIE_API_KEY = "your_realie_key"
+REALIE_API_KEY = "your_realie_key_here"
 ```
 
-RentCast can stay in secrets as a backup, but final comps in this version use Realie.
+## What V5 Adds
+
+- Analyze Property button uses Realie Property Search + Premium Comparables
+- Same property type lock
+- Starts with strict comp rules: 0.5 miles, 6 months, +/-300 sqft
+- Progressive fallback: 12 months, then 1 mile, then propertyType any only if needed
+- Buyer / Current Owner column in comps table
+- Clickable / expandable comp rows
+- Buyer/owner details per comp
+- Call/SMS launcher using tel: and sms: links
