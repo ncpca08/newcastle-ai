@@ -72,9 +72,16 @@ def parse_date(value):
     if not value:
         return None
     try:
-        return pd.to_datetime(value).to_pydatetime()
+        dt = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(dt):
+            return None
+        # Normalize to timezone-naive datetime so Streamlit/RentCast date formats compare safely.
+        return dt.tz_convert(None).to_pydatetime() if hasattr(dt, "tz_convert") else dt.to_pydatetime()
     except Exception:
-        return None
+        try:
+            return pd.to_datetime(value, errors="coerce").to_pydatetime()
+        except Exception:
+            return None
 
 
 def normalize_address(address: str) -> str:
