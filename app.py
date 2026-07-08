@@ -14,6 +14,23 @@ REALIE_BASE = "https://app.realie.ai"
 PROPERTY_SEARCH_PATH = "/api/public/property/search/"
 PREMIUM_COMPS_PATH = "/api/public/premium/comparables/"
 
+CITY_COUNTY_MAP = {
+    "stockton": "San Joaquin",
+    "san jose": "Santa Clara",
+    "modesto": "Stanislaus",
+    "fresno": "Fresno",
+    "bakersfield": "Kern",
+    "sacramento": "Sacramento",
+    "manteca": "San Joaquin",
+    "lodi": "San Joaquin",
+    "turlock": "Stanislaus",
+    "merced": "Merced",
+    "visalia": "Tulare",
+    "tulare": "Tulare",
+    "madera": "Madera",
+}
+
+
 # ----------------------------- helpers -----------------------------
 def money(v: Any) -> str:
     try:
@@ -71,41 +88,48 @@ def contact_links(phone: str, sms_body: str) -> Tuple[str, str]:
     return tel, sms
 
 def parse_address(full: str) -> Dict[str, str]:
-    """Lightweight parser built for common US property strings.
-    Accepts: 1342 Branham Ln #1, San Jose, CA 95118
-    Returns street/unit/city/state/zip. User can override in expander.
+    """Flexible parser for common seller-lead address formats.
+    Handles comma and non-comma formats like:
+    1342 Branham Ln #1, San Jose, CA 95118
+    1409 San Juan Ave Stockton, CA 95203
     """
-    text = (full or "").strip()
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"(?i)\b(lane)\b", "Ln", text)
-    text = re.sub(r"(?i)\b(avenue)\b", "Ave", text)
-    text = re.sub(r"(?i)\b(drive)\b", "Dr", text)
-    text = re.sub(r"(?i)\b(road)\b", "Rd", text)
-    text = re.sub(r"(?i)\b(street)\b", "St", text)
-    text = re.sub(r"(?i)\b(court)\b", "Ct", text)
-    text = re.sub(r"(?i)\b(place)\b", "Pl", text)
-    text = re.sub(r"(?i)\b(circle)\b", "Cir", text)
-    text = re.sub(r"(?i)\b(way)\b", "Way", text)
+    original = (full or "").strip()
+    text = re.sub(r"\s+", " ", original).strip(" ,")
     text = re.sub(r"\s*#\s*", " #", text)
 
     zip_code = ""
     mzip = re.search(r"\b(\d{5})(?:-\d{4})?\b", text)
     if mzip:
         zip_code = mzip.group(1)
-        text = text.replace(mzip.group(0), "").strip(" ,")
+        text = text[:mzip.start()] + text[mzip.end():]
+        text = text.strip(" ,")
 
-    state = ""
-    mstate = re.search(r",?\s*([A-Z]{2})\s*$", text)
+    state = "CA"
+    mstate = re.search(r",?\s*([A-Za-z]{2})\s*$", text)
     if mstate:
-        state = mstate.group(1)
+        state = mstate.group(1).upper()
         text = text[:mstate.start()].strip(" ,")
 
     parts = [p.strip() for p in text.split(",") if p.strip()]
-    street_part = parts[0] if parts else text
-    city = parts[1] if len(parts) > 1 else ""
+    if len(parts) >= 2:
+        street_part = parts[0]
+        city = parts[1]
+    else:
+        street_part = text
+        city = ""
+        low = text.lower()
+        # If no comma before city, pull a known city from the end.
+        for cname in sorted(CITY_COUNTY_MAP.keys(), key=len, reverse=True):
+            if low.endswith(" " + cname) or low == cname:
+                city = cname.title()
+                street_part = text[: len(text) - len(cname)].strip(" ,")
+                break
 
     unit = ""
-    patterns = [r"(?i)\s+(?:unit|apt|apartment|suite|ste)\s*#?\s*([A-Za-z0-9-]+)\b", r"\s+#\s*([A-Za-z0-9-]+)\b"]
+    patterns = [
+        r"(?i)\s+(?:unit|apt|apartment|suite|ste)\s*#?\s*([A-Za-z0-9-]+)\b",
+        r"\s+#\s*([A-Za-z0-9-]+)\b",
+    ]
     for pat in patterns:
         m = re.search(pat, street_part)
         if m:
@@ -113,7 +137,8 @@ def parse_address(full: str) -> Dict[str, str]:
             street_part = re.sub(pat, "", street_part).strip()
             break
 
-    return {"street": street_part.strip(), "unit": unit.strip(), "city": city.strip(), "state": state or "CA", "zip": zip_code}
+    county = CITY_COUNTY_MAP.get(city.lower().strip(), "") if city else ""
+    return {"street": street_part.strip(), "unit": unit.strip(), "city": city.strip(), "state": state, "zip": zip_code, "county": county}
 
 def api_get(path: str, params: Dict[str, Any], label: str) -> Dict[str, Any]:
     key = st.secrets.get("REALIE_API_KEY", "")
@@ -324,6 +349,26 @@ def build_comp_rows(comps: List[Dict[str, Any]], subject: Dict[str, Any], subjec
     rows.sort(key=lambda r: (-r["Match"], r["Distance"] if r["Distance"] is not None else 99))
     return rows
 
+def arv_tiers(rows: List[Dict[str, Any]], subject: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    sqft = num(subject.get("livingArea") or subject.get("buildingArea"))
+    if not sqft:
+        mv = num(subject.get("modelValue"))
+        return (mv * .95 if mv else None, mv, mv * 1.05 if mv else None)
+    vals = []
+    for r in rows[:10]:
+        ppsf = r.get("$/SF")
+        if ppsf:
+            vals.append(ppsf * sqft)
+    if not vals:
+        mv = num(subject.get("modelValue"))
+        return (mv * .95 if mv else None, mv, mv * 1.05 if mv else None)
+    vals = sorted(vals)
+    def pct(p):
+        idx = int(round((len(vals)-1) * p))
+        return vals[idx]
+    expected = weighted_arv(rows, subject) or sum(vals)/len(vals)
+    return pct(.25), expected, pct(.75)
+
 def weighted_arv(rows: List[Dict[str, Any]], subject: Dict[str, Any]) -> Optional[float]:
     if not rows: return None
     sqft = num(subject.get("livingArea") or subject.get("buildingArea"))
@@ -338,6 +383,118 @@ def weighted_arv(rows: List[Dict[str, Any]], subject: Dict[str, Any]) -> Optiona
         weights.append(w)
     return sum(vals) / sum(weights) if weights else None
 
+
+# ----------------------------- auth + lead queue -----------------------------
+def get_users() -> Dict[str, Any]:
+    users = st.secrets.get("users", {})
+    try:
+        return dict(users)
+    except Exception:
+        return {}
+
+def login_gate() -> Tuple[str, str]:
+    users = get_users()
+    if "auth_user" in st.session_state:
+        return st.session_state["auth_user"], st.session_state.get("auth_role", "admin")
+
+    # Do not lock the owner out before Secrets are configured.
+    if not users:
+        st.session_state["auth_user"] = "Marco"
+        st.session_state["auth_role"] = "admin"
+        return "Marco", "admin"
+
+    st.title("🏠 Newcastle AI Login")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    if st.button("Log in", type="primary"):
+        ukey = username.strip().lower()
+        rec = users.get(ukey)
+        if rec and str(rec.get("password", "")) == password:
+            st.session_state["auth_user"] = rec.get("name", username.strip().title())
+            st.session_state["auth_role"] = rec.get("role", "va")
+            st.rerun()
+        else:
+            st.error("Invalid login.")
+    st.stop()
+
+def seed_leads():
+    if "leads" not in st.session_state:
+        st.session_state["leads"] = []
+
+def add_lead(name: str, phone: str, address: str, source: str, assigned: str = "Unassigned"):
+    seed_leads()
+    st.session_state["leads"].append({
+        "id": f"L{len(st.session_state['leads'])+1:04d}",
+        "name": name or "Unknown Seller",
+        "phone": clean_phone(phone),
+        "address": address,
+        "source": source or "Manual",
+        "status": "New",
+        "assigned": assigned,
+        "locked_by": "",
+        "notes": "",
+        "created": datetime.now().strftime("%m/%d/%Y %I:%M %p"),
+    })
+
+def status_icon(status: str) -> str:
+    return {"New":"🔴", "In Progress":"🟠", "Follow Up":"🟡", "Hot":"🟢", "Offer Made":"🔵", "Dead":"⚫"}.get(status, "⚪")
+
+def render_lead_queue(current_user: str, role: str):
+    seed_leads()
+    st.header("Lead Queue")
+    st.caption("Temporary in-app queue. Next phase: sync this with Zoho Bigin so it becomes shared and persistent.")
+    with st.expander("Add lead manually", expanded=False):
+        c1, c2 = st.columns(2)
+        name = c1.text_input("Seller name", key="new_lead_name")
+        phone = c2.text_input("Phone", key="new_lead_phone")
+        addr = st.text_input("Property address", key="new_lead_addr")
+        c3, c4 = st.columns(2)
+        source = c3.selectbox("Source", ["SMS", "Email", "Website", "Referral", "Manual"], key="new_lead_source")
+        assigned = c4.selectbox("Assigned to", ["Unassigned", "Marco", "Doreen"], key="new_lead_assigned")
+        if st.button("Add to Queue"):
+            add_lead(name, phone, addr, source, assigned)
+            st.rerun()
+
+    leads = st.session_state["leads"]
+    if not leads:
+        st.info("No leads in the queue yet.")
+        return
+    counts = {s: sum(1 for l in leads if l["status"] == s) for s in ["New", "In Progress", "Follow Up", "Hot", "Offer Made", "Dead"]}
+    cols = st.columns(6)
+    for col, sname in zip(cols, counts):
+        col.metric(f"{status_icon(sname)} {sname}", counts[sname])
+
+    for i, lead in enumerate(leads):
+        title = f"{status_icon(lead['status'])} {lead['name']} — {lead['address']} — {lead['status']}"
+        with st.expander(title, expanded=lead["status"] in ["New", "Hot"]):
+            c1, c2, c3 = st.columns([1,1,1])
+            c1.write(f"**Source:** {lead['source']}")
+            c1.write(f"**Created:** {lead['created']}")
+            c2.write(f"**Assigned:** {lead['assigned']}")
+            c2.write(f"**Worked by:** {lead['locked_by'] or '—'}")
+            c3.write(f"**Phone:** {lead['phone'] or '—'}")
+            c3.write(f"**Lead ID:** {lead['id']}")
+
+            cc1, cc2, cc3 = st.columns(3)
+            new_status = cc1.selectbox("Status", ["New", "In Progress", "Follow Up", "Hot", "Offer Made", "Dead"], index=["New", "In Progress", "Follow Up", "Hot", "Offer Made", "Dead"].index(lead["status"]), key=f"status_{i}")
+            new_assigned = cc2.selectbox("Assigned", ["Unassigned", "Marco", "Doreen"], index=["Unassigned", "Marco", "Doreen"].index(lead["assigned"]) if lead["assigned"] in ["Unassigned", "Marco", "Doreen"] else 0, key=f"assigned_{i}")
+            if cc3.button("I'm working this", key=f"lock_{i}"):
+                lead["locked_by"] = current_user
+                lead["status"] = "In Progress"
+                st.rerun()
+            lead["status"] = new_status
+            lead["assigned"] = new_assigned
+            lead["notes"] = st.text_area("Notes", value=lead.get("notes", ""), key=f"notes_{i}")
+            d = clean_phone(lead.get("phone", ""))
+            msg = urllib.parse.quote(f"Hi {lead['name']}, this is Marco with Newcastle Partners. I was reaching out about {lead['address']}. Are you still open to selling?")
+            if d:
+                st.markdown(f"[📞 Call](tel:+1{d}) &nbsp;&nbsp; [💬 SMS](sms:+1{d}&body={msg})", unsafe_allow_html=True)
+            if st.button("Load in Analyzer", key=f"load_{i}"):
+                st.session_state["address_input"] = lead["address"]
+                st.session_state["seller_phone"] = lead["phone"]
+                st.session_state["seller_name"] = lead["name"]
+                st.rerun()
+
 # ----------------------------- UI -----------------------------
 st.markdown("""
 <style>
@@ -351,50 +508,64 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+current_user, current_role = login_gate()
+
 with st.sidebar:
     st.title("Settings")
-    st.markdown('<div class="good-pill">Primary Data Source: Realie</div>', unsafe_allow_html=True)
-    st.caption("RentCast is no longer used for final comps.")
+    st.caption(f"Logged in as: {current_user} ({current_role})")
+    if st.button("Log out"):
+        for k in ["auth_user", "auth_role"]:
+            st.session_state.pop(k, None)
+        st.rerun()
     repair_estimate = st.number_input("Repair Estimate", min_value=0, value=58000, step=1000)
     min_comps = st.number_input("Minimum comps before fallback", min_value=1, max_value=10, value=3, step=1)
-    show_diag = st.toggle("Show API diagnostics", value=False)
+    show_diag = st.toggle("Show API diagnostics", value=False) if current_role == "admin" else False
     st.divider()
     st.subheader("Contact Actions")
-    st.caption("Call/SMS opens your Mac/iPhone default calling or Messages app.")
+    st.caption("Marco can use Apple/Mac tel/sms links now. Doreen's calling provider can be connected later.")
 
 st.title("🏠 Newcastle AI Acquisition Analyzer")
-st.caption("Realie-powered V6: smart address parsing → verified comps → weighted ARV → MAO")
+st.caption("Realie-powered V7: login + lead queue + smart parsing + verified comps + weighted ARV")
 
-col1, col2 = st.columns([2.2, 1])
-with col1:
-    address_input = st.text_input("Property Address", value="1342 Branham Ln #1, San Jose, CA 95118")
-    parsed_default = parse_address(address_input)
-    with st.expander("Address details / override", expanded=False):
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            street = st.text_input("Street address only", value=parsed_default["street"])
-        with c2:
-            unit = st.text_input("Unit only", value=parsed_default["unit"])
-        c3, c4, c5 = st.columns([1, .5, 1])
-        with c3:
-            city = st.text_input("City", value=parsed_default["city"] or "San Jose")
-        with c4:
-            state = st.text_input("State", value=parsed_default["state"] or "CA")
-        with c5:
-            county = st.text_input("County", value="Santa Clara")
-    seller_phone = st.text_input("Seller Phone (optional, for Call/SMS buttons)", value="")
-    photo_link = st.text_input("Dropbox / Google Drive Photo Link", value="")
-with col2:
-    st.write("Upload Property Photos")
-    st.file_uploader("Upload", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True, label_visibility="collapsed")
-    st.caption("200MB per file • PNG, JPG, WEBP")
+tab_analyzer, tab_queue = st.tabs(["Property Analyzer", "Lead Queue"])
 
-sms_msg = st.text_input("SMS message", value="Hi, this is Marco with Newcastle Partners...")
-tel_link, sms_link = contact_links(seller_phone, sms_msg)
-if clean_phone(seller_phone):
-    st.markdown(f"[📞 Call Seller]({tel_link}) &nbsp;&nbsp; [💬 SMS Seller]({sms_link})", unsafe_allow_html=True)
+with tab_queue:
+    render_lead_queue(current_user, current_role)
 
-analyze = st.button("Analyze Property", type="primary", use_container_width=True)
+with tab_analyzer:
+    col1, col2 = st.columns([2.2, 1])
+    with col1:
+        address_input = st.text_input("Property Address", value=st.session_state.get("address_input", "1342 Branham Ln #1, San Jose, CA 95118"), key="address_input_box")
+        parsed_default = parse_address(address_input)
+        with st.expander("Address details / override", expanded=False):
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                street = st.text_input("Street address only", value=parsed_default["street"])
+            with c2:
+                unit = st.text_input("Unit only", value=parsed_default["unit"])
+            c3, c4, c5 = st.columns([1, .5, 1])
+            with c3:
+                city = st.text_input("City", value=parsed_default["city"])
+            with c4:
+                state = st.text_input("State", value=parsed_default["state"] or "CA")
+            with c5:
+                county = st.text_input("County", value=parsed_default.get("county", ""))
+        seller_name = st.text_input("Seller Name", value=st.session_state.get("seller_name", ""))
+        seller_phone = st.text_input("Seller Phone (optional, for Call/SMS buttons)", value=st.session_state.get("seller_phone", ""))
+        photo_link = st.text_input("Dropbox / Google Drive Photo Link", value="")
+    with col2:
+        st.write("Upload Property Photos")
+        st.file_uploader("Upload", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True, label_visibility="collapsed")
+        st.caption("200MB per file • PNG, JPG, WEBP")
+
+    street_for_msg = street or parsed_default.get("street", "the property")
+    sms_template = "Hi {seller_name}, this is Marco with Newcastle Partners. I was reaching out about {street_address}. Are you still open to selling?"
+    sms_msg = st.text_input("SMS message", value=sms_template.format(seller_name=seller_name or "there", street_address=street_for_msg))
+    tel_link, sms_link = contact_links(seller_phone, sms_msg)
+    if clean_phone(seller_phone):
+        st.markdown(f"[📞 Call Seller]({tel_link}) &nbsp;&nbsp; [💬 SMS Seller]({sms_link})", unsafe_allow_html=True)
+
+    analyze = st.button("Analyze Property", type="primary", use_container_width=True)
 
 if analyze:
     parsed = {"street": street.strip(), "unit": unit.strip(), "city": city.strip(), "state": state.strip() or "CA", "zip": parsed_default.get("zip", "")}
@@ -407,7 +578,7 @@ if analyze:
         subject = find_subject(props, parsed.get("unit"))
         if not subject:
             status.update(label="Property not found", state="error")
-            st.error("Realie did not return a subject property. Try spelling out Lane, Avenue, Drive, etc., or remove the unit and retry.")
+            st.error("Property not found. Check the parsed Street/City/County fields under Address details. County can be left blank if unsure.")
             st.stop()
         st.write("Property found.")
         subject_type = identify_property_type(subject)
@@ -451,15 +622,18 @@ if analyze:
         c.markdown(f'<div class="metric-card"><div class="metric-label">{lab}</div><div class="metric-value">{val}</div></div>', unsafe_allow_html=True)
     st.caption(f"Owner: {subject.get('ownerName','—')} | Parcel: {subject.get('parcelId','—')} | Legal: {subject.get('legalDesc','—')}")
 
-    arv = weighted_arv(best_rows, subject) or num(subject.get("modelValue"))
+    conservative_arv, expected_arv, aggressive_arv = arv_tiers(best_rows, subject)
+    arv = conservative_arv or expected_arv or num(subject.get("modelValue"))
     confidence = min(99, max(55, round((sum(r["Match"] for r in best_rows[:6]) / max(1, len(best_rows[:6])) / 150) * 100))) if best_rows else 55
     st.subheader("ARV + Offer Matrix")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Recommended ARV", money(arv))
-    c2.metric("Confidence", f"{confidence}%")
-    c3.metric("Comps Used", str(min(len(best_rows), 6)))
-    c4.metric("Comp Rule Used", rule_used["label"] if rule_used else "—")
+    c1.metric("Conservative ARV", money(conservative_arv))
+    c2.metric("Expected ARV", money(expected_arv))
+    c3.metric("Aggressive ARV", money(aggressive_arv))
+    c4.metric("Confidence", f"{confidence}%")
+    st.caption(f"Comps used: {min(len(best_rows), 6)} | Rule: {rule_used['label'] if rule_used else '—'}")
 
+    st.markdown("#### Offer Matrix uses Conservative ARV")
     oc = st.columns(4)
     for col, pct in zip(oc, [.75, .70, .65, .60]):
         before = (arv or 0) * pct
