@@ -577,6 +577,75 @@ def realie_address_lookup(state: str, street_address: str, unit: str = "", city:
         return {"ok": False, "url_tested": url, "params": params, "error": str(e)}
 
 
+
+def realie_property_search(state: str, street_address: str, unit: str = "", city: str = "", county: str = "", residential: bool = True, limit: int = 10):
+    if not REALIE_API_KEY:
+        return {"ok": False, "error": "Missing REALIE_API_KEY in Streamlit secrets."}
+    url = "https://app.realie.ai/api/public/property/search/"
+    params = {
+        "state": state.strip().upper(),
+        "address": street_address.strip(),
+        "residential": str(bool(residential)).lower(),
+        "limit": int(limit),
+    }
+    if unit.strip():
+        params["unitNumberStripped"] = unit.strip().replace("#", "").replace("UNIT", "").replace("APT", "").strip()
+    if city.strip():
+        params["city"] = city.strip()
+    if county.strip():
+        params["county"] = county.strip()
+    try:
+        r = requests.get(url, headers=realie_headers(), params=params, timeout=30)
+        try:
+            body = r.json()
+        except Exception:
+            body = None
+        return {
+            "ok": 200 <= r.status_code < 300,
+            "status_code": r.status_code,
+            "url_tested": url,
+            "params": params,
+            "content_type": r.headers.get("content-type", ""),
+            "body_preview": (r.text or "")[:8000],
+            "json": body if isinstance(body, (dict, list)) else None,
+        }
+    except Exception as e:
+        return {"ok": False, "url_tested": url, "params": params, "error": str(e)}
+
+
+def deep_find_first(obj, keys):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k).lower() in [x.lower() for x in keys] and v not in [None, "", []]:
+                return v
+        for v in obj.values():
+            found = deep_find_first(v, keys)
+            if found not in [None, "", []]:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = deep_find_first(item, keys)
+            if found not in [None, "", []]:
+                return found
+    return None
+
+
+def extract_first_property(result):
+    body = result.get("json") if isinstance(result, dict) else None
+    if isinstance(body, dict):
+        props = body.get("properties") or body.get("results") or body.get("data")
+        if isinstance(props, list) and props:
+            return props[0]
+        if isinstance(props, dict):
+            return props
+    return None
+
+
+def extract_lat_lon_from_property(prop):
+    lat = deep_find_first(prop, ["latitude", "lat"])
+    lon = deep_find_first(prop, ["longitude", "lon", "lng"])
+    return lat, lon
+
 def realie_comparables_search(latitude, longitude, radius=0.5, months=6, max_results=25, sqft_min=None, sqft_max=None, beds=None, baths=None, property_type="any"):
     if not REALIE_API_KEY:
         return {"ok": False, "error": "Missing REALIE_API_KEY in Streamlit secrets."}
@@ -832,20 +901,23 @@ with st.sidebar:
 
     st.divider()
     st.header("Realie API Test")
-    st.caption("Add REALIE_API_KEY in Streamlit Secrets first. Start with Address Lookup.")
-    realie_test_type = st.selectbox("Realie test type", ["Address Lookup", "Comparables Search"], index=0)
-    if realie_test_type == "Address Lookup":
-        realie_state = st.text_input("State", value="CA")
-        realie_street = st.text_input("Street address only", value="1342 Branham Ln")
-        realie_unit = st.text_input("Unit only", value="1")
-        realie_city = st.text_input("City", value="San Jose")
-        realie_county = st.text_input("County", value="Santa Clara")
-        if st.button("Test Realie Address Lookup", use_container_width=True):
-            result = realie_address_lookup(realie_state, realie_street, realie_unit, realie_city, realie_county)
-            st.write("Realie address lookup result")
+    st.caption("Uses REALIE_API_KEY in Streamlit Secrets. Realie uses Authorization header, not X-API-Key.")
+    realie_test_type = st.selectbox("Realie test type", ["Property Search", "Premium Comparables", "Search + Auto Comps", "Legacy Address Lookup"], index=0)
+
+    realie_state = st.text_input("State", value="CA")
+    realie_street = st.text_input("Street address only", value="1342 Branham Ln")
+    realie_unit = st.text_input("Unit only", value="1")
+    realie_city = st.text_input("City", value="San Jose")
+    realie_county = st.text_input("County", value="Santa Clara")
+
+    if realie_test_type == "Property Search":
+        if st.button("Test Realie Property Search", use_container_width=True):
+            result = realie_property_search(realie_state, realie_street, realie_unit, realie_city, realie_county, True, 10)
+            st.write("Realie property search result")
             st.json(result)
-    else:
-        st.caption("Use latitude/longitude from the Address Lookup response if available.")
+
+    elif realie_test_type == "Premium Comparables":
+        st.caption("Use latitude/longitude from Property Search response if available.")
         realie_lat = st.text_input("Latitude", value="")
         realie_lon = st.text_input("Longitude", value="")
         realie_radius = st.number_input("Radius miles", min_value=0.1, value=0.5, step=0.1)
@@ -855,7 +927,7 @@ with st.sidebar:
         realie_beds = st.text_input("Beds exact", value="2")
         realie_baths = st.text_input("Baths exact", value="1")
         realie_type = st.selectbox("Property type", ["condo", "house", "any"], index=0)
-        if st.button("Test Realie Comparables", use_container_width=True):
+        if st.button("Test Realie Premium Comparables", use_container_width=True):
             if not realie_lat or not realie_lon:
                 st.error("Latitude and longitude are required for Realie comparables.")
             else:
@@ -863,8 +935,30 @@ with st.sidebar:
                     realie_lat, realie_lon, realie_radius, realie_months, 25,
                     realie_sqft_min, realie_sqft_max, realie_beds, realie_baths, realie_type
                 )
-                st.write("Realie comparables result")
+                st.write("Realie premium comparables result")
                 st.json(result)
+
+    elif realie_test_type == "Search + Auto Comps":
+        st.caption("This searches the property first, tries to extract lat/lon, then runs Premium Comparables automatically.")
+        if st.button("Test Realie Search + Auto Comps", use_container_width=True):
+            search_result = realie_property_search(realie_state, realie_street, realie_unit, realie_city, realie_county, True, 10)
+            st.write("Step 1: Property Search")
+            st.json(search_result)
+            prop = extract_first_property(search_result)
+            lat, lon = extract_lat_lon_from_property(prop) if prop else (None, None)
+            st.write({"lat_found": lat, "lon_found": lon})
+            if lat and lon:
+                comps_result = realie_comparables_search(lat, lon, 0.5, 6, 25, 510, 1110, 2, 1, "condo")
+                st.write("Step 2: Premium Comparables")
+                st.json(comps_result)
+            else:
+                st.warning("Property search worked, but I could not find latitude/longitude in the first result. Send this screenshot so we can map Realie's field names.")
+
+    else:
+        if st.button("Test Realie Legacy Address Lookup", use_container_width=True):
+            result = realie_address_lookup(realie_state, realie_street, realie_unit, realie_city, realie_county)
+            st.write("Realie legacy address lookup result")
+            st.json(result)
 
 
     st.divider()

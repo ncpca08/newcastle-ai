@@ -1,16 +1,21 @@
-# Newcastle AI - Realie Tester Patch
+# Newcastle AI - Realie Tester v3
 
-Adds a Realie API test section to the Streamlit sidebar.
+Adds corrected Realie testing tools:
+
+- Property Search: `https://app.realie.ai/api/public/property/search/`
+- Premium Comparables: `https://app.realie.ai/api/public/premium/comparables/`
+- Uses header: `Authorization: <REALIE_API_KEY>`
 
 ## Streamlit Secrets
-Add:
+
+Keep existing keys and add:
 
 ```toml
 REALIE_API_KEY = "your_realie_key_here"
 ```
 
-Keep your existing RentCast key for now.
+## Testing Order
 
-## Testing
-1. Test Realie Address Lookup first.
-2. If it returns latitude/longitude, use those values in Realie Comparables Search.
+1. Test **Property Search** first.
+2. If it returns latitude/longitude, test **Premium Comparables**.
+3. Or use **Search + Auto Comps** to run both.
