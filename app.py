@@ -82,6 +82,10 @@ def safe_float(v, default=None):
 
 
 def normalize_address(full):
+    """Accept natural addresses and normalize to Realie-friendly fields.
+    Handles: "1342 Branham Ln #1, San Jose, CA 95118" and
+    "1409 San Juan Ave Stockton CA 95203".
+    """
     raw = (full or "").strip()
     raw = re.sub(r"\s+", " ", raw)
     unit = ""
@@ -89,21 +93,55 @@ def normalize_address(full):
     if m:
         unit = m.group(1).strip()
         raw = re.sub(r"\s*(?:#|unit\s+|apt\s+|apartment\s+|ste\s+)[A-Za-z0-9-]+", "", raw, flags=re.I)
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    street = parts[0] if parts else raw
-    city = parts[1] if len(parts) > 1 else ""
+
     state = "CA"
     zip_code = ""
-    if len(parts) > 2:
-        m2 = re.search(r"\b([A-Z]{2})\b\s*(\d{5})?", parts[2], flags=re.I)
+    city = ""
+    street = raw
+
+    # Best path: comma separated street, city, state zip
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if len(parts) >= 2:
+        street = parts[0]
+        city = parts[1]
+        if len(parts) >= 3:
+            m2 = re.search(r"\b([A-Z]{2})\b\s*(\d{5})?", parts[2], flags=re.I)
+            if m2:
+                state = m2.group(1).upper()
+                zip_code = m2.group(2) or ""
+    else:
+        # No commas: try to find state + ZIP at the end, then split known cities.
+        m2 = re.search(r"\b([A-Z]{2})\b\s*(\d{5})\s*$", raw, flags=re.I)
+        working = raw
         if m2:
             state = m2.group(1).upper()
             zip_code = m2.group(2) or ""
-    street = street.replace(" Ln", " Lane").replace(" LN", " Lane")
-    street = street.replace(" Ave", " Avenue").replace(" AVE", " Avenue")
-    street = street.replace(" Dr", " Drive").replace(" DR", " Drive")
-    street = street.replace(" St", " Street").replace(" ST", " Street")
-    return {"street": street.strip(), "unit": unit, "city": city, "state": state, "zip": zip_code}
+            working = raw[:m2.start()].strip().rstrip(',')
+        known_cities = [
+            "san jose", "stockton", "modesto", "fresno", "bakersfield", "turlock", "manteca",
+            "merced", "visalia", "tulare", "madera", "sacramento", "lodi", "woodland",
+            "yuba city", "oakland", "san bruno", "south san francisco", "los angeles", "encino",
+        ]
+        lw = working.lower()
+        for c in sorted(known_cities, key=len, reverse=True):
+            token = " " + c
+            if token in lw:
+                idx = lw.rfind(token)
+                street = working[:idx].strip().rstrip(',')
+                city = working[idx:].strip().strip(',')
+                break
+        else:
+            street = working
+
+    # Realie seems to match better when common suffixes are spelled out.
+    replacements = {
+        r"\bLn\b": "Lane", r"\bAve\b": "Avenue", r"\bDr\b": "Drive", r"\bSt\b": "Street",
+        r"\bRd\b": "Road", r"\bCt\b": "Court", r"\bPl\b": "Place", r"\bBlvd\b": "Boulevard",
+        r"\bWay\b": "Way",
+    }
+    for pat, rep in replacements.items():
+        street = re.sub(pat, rep, street, flags=re.I)
+    return {"street": street.strip(), "unit": unit, "city": city.strip().title(), "state": state, "zip": zip_code}
 
 
 def realie_headers():
@@ -173,22 +211,37 @@ def prop_type(prop):
 
 
 def best_sale(comp):
+    """Return the most reliable arm's-length sale date/price.
+    We avoid using internal/non-sale transfers such as IT/QC as comps.
+    """
+    sale_doc_types = {"GD", "WD", "SWD", "BARG", "GRANT", "DEED"}
+    bad_doc_types = {"IT", "QC", "QCD", "TR", "TD", "MTG", "REL", "AFF"}
     transfers = comp.get("transfers") or []
     candidates = []
     for t in transfers:
         price = safe_float(t.get("transferPrice"), 0)
         dt = parse_date(t.get("transferDateObject") or t.get("transferDate"))
         doc = str(t.get("transferDocType", "")).upper()
-        if price and price > 10000 and dt and doc not in {"IT", "QC"}:
-            candidates.append((dt, price, t))
+        if price and price > 10000 and dt and doc not in bad_doc_types:
+            # Prefer grant/warranty sale deeds; allow blank/unknown only if price exists.
+            score = 2 if doc in sale_doc_types else 1
+            candidates.append((score, dt, price, t))
     if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][0], candidates[0][1], candidates[0][2]
-    for price_key, date_key in [("transferPrice", "transferDateObject"), ("salePriceLastTransfer", "transferDateObject"), ("pastPriceSale", "priorSalesDate")]:
-        price = safe_float(comp.get(price_key), 0)
-        dt = parse_date(comp.get(date_key))
-        if price and price > 10000 and dt:
-            return dt, price, {}
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return candidates[0][1], candidates[0][2], candidates[0][3]
+
+    # Last-sale fields only when the last transfer doc appears sale-like.
+    last_doc = str(comp.get("saleDocumentTypeLastSale") or comp.get("transferDocType") or "").upper()
+    if last_doc not in bad_doc_types:
+        for price_key, date_key in [
+            ("salePriceLastTransfer", "ownershipStartDate"),
+            ("transferPrice", "transferDateObject"),
+            ("pastPriceSale", "priorSalesDate"),
+        ]:
+            price = safe_float(comp.get(price_key), 0)
+            dt = parse_date(comp.get(date_key))
+            if price and price > 10000 and dt:
+                return dt, price, {}
     return None, None, {}
 
 
@@ -211,39 +264,49 @@ def distance_miles(lat1, lon1, lat2, lon2):
 
 
 def get_comps(subject, min_needed=3):
+    """Pull comps using strict rules first.
+    Business rule: do not show anything older than 6 months unless there are 3 or fewer valid comps.
+    Same property type stays locked; no silent mixing with other property types.
+    """
     lat = safe_float(subject.get("latitude"))
     lon = safe_float(subject.get("longitude"))
     sqft = safe_float(subject.get("livingArea") or subject.get("buildingArea"), 0)
     beds = int(safe_float(subject.get("totalBedrooms"), 0) or 0)
     baths = int(safe_float(subject.get("totalBathrooms"), 0) or 0)
     ptype = prop_type(subject)
+    base = {
+        "latitude": lat, "longitude": lon, "maxResults": 75,
+        "propertyType": ptype,
+        "sqftMin": max(0, sqft-300), "sqftMax": sqft+300,
+        "bedsMin": beds, "bedsMax": beds,
+        "bathsMin": baths, "bathsMax": baths,
+    }
+    # Pull enough data to verify, but final visible set is filtered below.
     params_list = [
-        {"radius": 0.5, "timeFrame": 6, "propertyType": ptype, "sqftMin": max(0, sqft-300), "sqftMax": sqft+300, "bedsMin": beds, "bedsMax": beds, "bathsMin": baths, "bathsMax": baths},
-        {"radius": 1.0, "timeFrame": 12, "propertyType": ptype, "sqftMin": max(0, sqft-300), "sqftMax": sqft+300, "bedsMin": beds, "bedsMax": beds, "bathsMin": baths, "bathsMax": baths},
-        {"radius": 1.0, "timeFrame": 18, "propertyType": "any", "sqftMin": max(0, sqft-300), "sqftMax": sqft+300, "bedsMin": beds, "bedsMax": beds, "bathsMin": baths, "bathsMax": baths},
-        {"radius": 2.0, "timeFrame": 24, "propertyType": "any", "sqftMin": max(0, sqft-400), "sqftMax": sqft+400},
+        {**base, "radius": 0.5, "timeFrame": 6},
+        {**base, "radius": 1.0, "timeFrame": 6},
+        {**base, "radius": 1.0, "timeFrame": 12},
     ]
     all_comps = []
-    used_rule = ""
     debug = []
-    for rule in params_list:
-        params = {"latitude": lat, "longitude": lon, "maxResults": 50, **rule}
+    for params in params_list:
         code, url, js = realie_get("/premium/comparables/", params)
         debug.append({"status": code, "url": url, "params": params, "preview": str(js)[:500]})
         comps = js.get("comparables") or []
-        if comps:
-            all_comps.extend(comps)
-            used_rule = f"{rule.get('radius')} mi / {rule.get('timeFrame')} mo / {rule.get('propertyType')} / ±{int((rule.get('sqftMax', sqft)-sqft) if sqft else 0)} sqft"
-        if len(all_comps) >= min_needed * 2:
-            break
-    # dedupe by parcel + sale price/date if possible
+        all_comps.extend(comps)
+
     dedup = {}
     for c in all_comps:
         dt, price, _ = best_sale(c)
-        key = (c.get("parcelId"), fmt_date(dt.isoformat() if dt else None), int(price or 0))
+        if not dt or not price:
+            continue
+        # Hard lock property type.
+        if prop_type(c) != ptype:
+            continue
+        key = (c.get("parcelId"), dt.strftime("%Y%m%d"), int(price or 0))
         dedup[key] = c
     comps = list(dedup.values())
-    return comps, used_rule or "No rule returned comps", debug
+    return comps, "Strict: same property type / ±300 sqft / 6 months preferred / 12 months only if needed", debug
 
 
 def score_comp(subject, comp):
@@ -412,7 +475,7 @@ def offer_composer(subject, tiers, seller_name, seller_phone, address):
     with c1:
         buyer_entity = st.text_input("Buyer entity", value="Newcastle Partners CA LLC")
         seller_name = st.text_input("Seller name", value=seller_name or subject.get("ownerName", ""))
-        purchase_price = st.number_input("Purchase price", min_value=0, value=int(tiers["quick_sale"] * 0.75 - st.session_state.get("repair_estimate", 58000)), step=1000)
+        purchase_price = st.number_input("Purchase price", min_value=0, value=int(tiers["quick_sale"] * 0.75), step=1000)
         emd = st.number_input("EMD", min_value=0, value=5000, step=500)
     with c2:
         inspection = st.selectbox("Inspection period", ["5 days", "7 days", "10 days", "15 days"], index=1)
@@ -450,7 +513,9 @@ def offer_composer(subject, tiers, seller_name, seller_phone, address):
 def analyze_page(user):
     st.title("🏠 Newcastle AI Acquisition Analyzer")
     st.caption("Realie-powered: verified comps → value tiers → purchase guide → offer composer")
-    address = st.text_input("Property Address", value=st.session_state.get("property_address", "1342 Branham Ln #1, San Jose, CA 95118"), key="property_address")
+    if "property_address" not in st.session_state:
+        st.session_state.property_address = "1342 Branham Ln #1, San Jose, CA 95118"
+    address = st.text_input("Property Address", key="property_address")
     with st.expander("Address details / override"):
         o1, o2, o3, o4 = st.columns(4)
         street_o = o1.text_input("Street override", value="")
@@ -471,10 +536,17 @@ def analyze_page(user):
             if not subject:
                 st.error("Property not found. Try spelling out Lane/Avenue/Drive or use Address details override.")
                 return
-            comps, rule, debug = get_comps(subject, min_needed=int(st.session_state.get("min_comps", 3)))
-            rows = comp_rows(subject, comps)
+            comps, rule, debug = get_comps(subject, min_needed=3)
+            all_rows = comp_rows(subject, comps)
+            six_month_rows = [r for r in all_rows if months_ago(r.get("_sold_dt")) <= 6]
+            if len(six_month_rows) > 3:
+                rows = six_month_rows
+                visible_rule = "Strict: newest verified sales only / same property type / ±300 sqft / 6 months"
+            else:
+                rows = [r for r in all_rows if months_ago(r.get("_sold_dt")) <= 12]
+                visible_rule = "Backup: 12 months used because 3 or fewer 6-month comps were found"
             tiers = arv_tiers(rows)
-            st.session_state.analysis = {"subject": subject, "rows": rows, "tiers": tiers, "rule": rule, "debug": debug}
+            st.session_state.analysis = {"subject": subject, "rows": rows, "tiers": tiers, "rule": visible_rule, "debug": debug}
     analysis = st.session_state.get("analysis")
     if analysis:
         subject = analysis["subject"]; rows = analysis["rows"]; tiers = analysis["tiers"]; rule = analysis["rule"]
@@ -486,24 +558,22 @@ def analyze_page(user):
             col.metric(label, val or "—")
         st.caption(f"Owner: {subject.get('ownerName','—')} | APN/Parcel: {subject.get('parcelId') or subject.get('state_parcelId') or '—'} | Legal: {subject.get('legalDesc','—')}")
         if tiers:
-            st.header("📈 Property Value")
+            st.header("📈 ARV Range")
             c = st.columns(4)
-            c[0].metric("Quick Sale Value", money(tiers["quick_sale"]))
-            c[1].metric("Market Value", money(tiers["market"]))
-            c[2].metric("Premium Value", money(tiers["premium"]))
+            c[0].metric("Conservative ARV", money(tiers["quick_sale"]))
+            c[1].metric("Expected ARV", money(tiers["market"]))
+            c[2].metric("Aggressive ARV", money(tiers["premium"]))
             c[3].metric("Confidence", f"{tiers['confidence']}%")
-            st.caption(f"Comps used for value: {len(tiers['used'])} | Total verified comps shown: {len(rows)} | Rule: {rule}")
-            st.header("💰 Recommended Purchase Prices")
-            base = tiers["quick_sale"]
-            repair = st.session_state.get("repair_estimate", 58000)
-            labels = [("Wholesale / Light Rehab", .75), ("Fix & Flip", .70), ("Heavy Rehab", .65), ("High Risk", .60)]
-            cols = st.columns(4)
-            for col, (label, pct) in zip(cols, labels):
-                before = base * pct
-                col.metric(label, money(before))
-                col.caption(f"After repairs: {money(before - repair)}")
+            st.caption(f"Comps used for ARV: {len(tiers['used'])} | Verified comps shown: {len(rows)} | Rule: {rule}")
+            with st.expander("Optional purchase guide", expanded=False):
+                st.caption("These are not buyer resale prices. They are quick acquisition reference points using the Conservative ARV. Final offer should account for repairs, fees, holding costs, and desired profit.")
+                base = tiers["quick_sale"]
+                labels = [("75% of Conservative ARV", .75), ("70% of Conservative ARV", .70), ("65% of Conservative ARV", .65), ("60% of Conservative ARV", .60)]
+                cols = st.columns(4)
+                for col, (label, pct) in zip(cols, labels):
+                    col.metric(label, money(base * pct))
         st.header("Comparable Sales")
-        st.caption("Same property type locked. Sorted newest sold first. Buyer/current owner uses grantee first, then ownerName fallback.")
+        st.caption("Same property type locked. Only 6-month comps are shown unless there are 3 or fewer, then 12-month backup is used. Sorted newest verified sale first.")
         display = []
         for r in rows[:50]:
             display.append({
@@ -536,28 +606,10 @@ def main():
         if st.button("Logout"):
             st.session_state.auth = None
             st.rerun()
-        st.divider()
-        st.session_state.page = st.radio("Navigation", ["Dashboard", "Lead Queue", "Analyze Property", "Map"], index=["Dashboard", "Lead Queue", "Analyze Property", "Map"].index(st.session_state.get("page", "Analyze Property")))
-        st.divider()
-        st.session_state.repair_estimate = st.number_input("Repair Estimate", min_value=0, value=int(st.session_state.get("repair_estimate", 58000)), step=1000)
-        st.session_state.min_comps = st.number_input("Minimum comps before fallback", min_value=1, value=int(st.session_state.get("min_comps", 3)), step=1)
         if user["role"] == "admin":
             st.session_state.show_api_diag = st.toggle("Show API diagnostics", value=st.session_state.get("show_api_diag", False))
-    if st.session_state.page == "Dashboard":
-        st.title("Dashboard")
-        seed_leads()
-        c = st.columns(4)
-        c[0].metric("New Leads", sum(1 for l in st.session_state.leads if l["status"] == "New"))
-        c[1].metric("In Progress", sum(1 for l in st.session_state.leads if l["status"] == "In Progress"))
-        c[2].metric("Follow Ups", sum(1 for l in st.session_state.leads if l["status"] == "Follow Up"))
-        c[3].metric("Hot Leads", sum(1 for l in st.session_state.leads if l["status"] == "Hot"))
-    elif st.session_state.page == "Lead Queue":
-        lead_queue(user)
-    elif st.session_state.page == "Map":
-        a = st.session_state.get("analysis")
-        lead_map(a.get("subject") if a else None, a.get("rows") if a else None)
-    else:
-        analyze_page(user)
+    # Keep the app focused on the analyzer for now. No side navigation, no fallback/repair controls.
+    analyze_page(user)
 
 
 if __name__ == "__main__":

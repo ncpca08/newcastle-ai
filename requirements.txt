@@ -1,3 +1,5 @@
-streamlit
-requests
-pandas
+streamlit>=1.36
+requests>=2.31
+pandas>=2.0
+pydeck>=0.8
+python-dateutil>=2.8

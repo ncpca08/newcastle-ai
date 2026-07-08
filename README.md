@@ -1,11 +1,12 @@
-# Newcastle AI Realie Analyzer V8
+# Newcastle AI V10
 
-Adds bulletproof comp handling:
-
-- Comparable sales are displayed newest sold first.
-- Same property type lock remains enforced.
-- Uses a verified sale event parser to avoid showing non-sale transfer dates as comp sold dates.
-- Runs a Realie comparable sweep instead of stopping too early.
-- Keeps ±300 sqft as the preferred comp range and starts with 6 months before using 12-month backup.
-- ARV still uses best scored comps while the comp table displays newest sales first.
-- Buyer/current owner column remains included.
+Fixes requested by Marco:
+- Removed side navigation menu from the main app
+- Removed repair estimate and fallback controls from sidebar
+- Improved address persistence so the address does not switch when returning to the tab
+- Cleaner ARV Range section
+- Purchase guide moved into optional expander
+- Comps are same property type locked
+- Comps display newest verified sale first
+- Only shows 6-month comps unless there are 3 or fewer, then uses 12-month backup
+- Stricter deed/sale-date handling to avoid using non-sale transfers as sold comps
