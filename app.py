@@ -228,27 +228,65 @@ def comp_search(lat: float, lon: float, rule: Dict[str, Any], subject_type: str,
         params["bathsMax"] = baths
     return api_get(PREMIUM_COMPS_PATH, params, f"Comps: {rule['label']}")
 
-def sale_price(c: Dict[str, Any]) -> Optional[float]:
-    for k in ["transferPrice", "salePriceLastTransfer", "pastPriceTransfer", "pastPriceSale", "assessorSalePrice"]:
-        v = num(c.get(k))
-        if v and v > 10000:
-            return v
-    transfers = c.get("transfers") or []
-    for tr in transfers:
-        v = num(tr.get("transferPrice"))
-        if v and v > 10000:
-            return v
+def parse_dt(raw: Any) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        s = str(raw)
+        if len(s) == 8 and s.isdigit():
+            return datetime.strptime(s, "%Y%m%d").replace(tzinfo=timezone.utc)
+        if "T" in s:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
     return None
 
+def best_sale(c: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the best actual sale event from Realie.
+    Preference is recorded purchase sale date + transfer price, then grant deed transfers.
+    This avoids using non-sale/intra-family transfer dates as the comp sold date when a true sale date exists.
+    """
+    candidates = []
+
+    def add(price, date, doc_type="", source="", verified=False):
+        p = num(price)
+        d = parse_dt(date)
+        if not p or p < 10000 or not d:
+            return
+        candidates.append({
+            "price": p,
+            "date_raw": date,
+            "date_obj": d,
+            "doc_type": doc_type or "—",
+            "source": source,
+            "verified": verified,
+        })
+
+    # Best source when available: purchaseSaleDate is the contract/sale date; transferPrice is the recorded sale price.
+    add(c.get("transferPrice"), c.get("purchaseSaleDate"), c.get("saleDocumentTypeLastSale") or c.get("transferDocType"), "purchaseSaleDate + transferPrice", True)
+    add(c.get("salePriceLastTransfer"), c.get("purchaseSaleDate"), c.get("saleDocumentTypeLastSale"), "purchaseSaleDate + salePriceLastTransfer", True)
+
+    # Next: recorded grant deed style transfers. Avoid making IT/QC transfers primary unless no better sale exists.
+    for tr in c.get("transfers") or []:
+        doc = str(tr.get("transferDocType") or c.get("transferDocType") or "").upper()
+        is_sale_doc = doc in {"GD", "WD", "DEED", "GRANT DEED"}
+        add(tr.get("transferPrice"), tr.get("transferDateObject") or tr.get("transferDate"), doc, "transfers[]", is_sale_doc)
+
+    add(c.get("transferPrice"), c.get("transferDateObject") or c.get("transferDate"), c.get("transferDocType"), "top-level transfer", False)
+    add(c.get("pastPriceSale"), c.get("priorSalesDate") or c.get("pastRecoDateSale"), c.get("pastDocumentTypeSale"), "prior sale", True)
+
+    if not candidates:
+        return {"price": None, "date_raw": None, "date_obj": None, "doc_type": "—", "source": "none", "verified": False}
+
+    # Prefer verified sale events, then newest.
+    candidates.sort(key=lambda x: (1 if x["verified"] else 0, x["date_obj"]), reverse=True)
+    return candidates[0]
+
+def sale_price(c: Dict[str, Any]) -> Optional[float]:
+    return best_sale(c).get("price")
+
 def sale_date(c: Dict[str, Any]) -> Any:
-    for k in ["transferDateObject", "transferDate", "purchaseSaleDate", "recordingDate", "purchaseRecordingDate"]:
-        if c.get(k):
-            return c.get(k)
-    transfers = c.get("transfers") or []
-    for tr in transfers:
-        if tr.get("transferDateObject") or tr.get("transferDate"):
-            return tr.get("transferDateObject") or tr.get("transferDate")
-    return None
+    return best_sale(c).get("date_raw")
 
 def buyer_name(c: Dict[str, Any]) -> str:
     return c.get("grantee") or c.get("ownerName") or "—"
@@ -316,18 +354,19 @@ def build_comp_rows(comps: List[Dict[str, Any]], subject: Dict[str, Any], subjec
     seen = set()
     subj_parcel = subject.get("parcelId")
     for c in comps:
-        price = sale_price(c)
+        sale = best_sale(c)
+        price = sale.get("price")
         sqft = num(c.get("livingArea") or c.get("buildingArea"))
         if not price or not sqft:
             continue
         if c.get("parcelId") == subj_parcel:
             continue
-        # strict type lock
+        # strict type lock: no condo/SFR mixing
         if subject_type == "condo" and c.get("condo") is not True:
             continue
         if subject_type == "house" and c.get("condo") is True:
             continue
-        key = (c.get("parcelId"), price, sale_date(c))
+        key = (c.get("parcelId"), round(price), fmt_date(sale.get("date_raw")))
         if key in seen:
             continue
         seen.add(key)
@@ -335,8 +374,10 @@ def build_comp_rows(comps: List[Dict[str, Any]], subject: Dict[str, Any], subjec
         score = comp_score(c, subject, subject_type)
         rows.append({
             "raw": c,
+            "sale": sale,
             "Address": c.get("addressFull") or c.get("addressUnit") or c.get("address") or c.get("addressRaw") or "—",
-            "Sold Date": fmt_date(sale_date(c)),
+            "Sold Date": fmt_date(sale.get("date_raw")),
+            "Sold Date Obj": sale.get("date_obj"),
             "Sold Price": price,
             "$/SF": price / sqft if sqft else None,
             "SqFt": int(sqft) if sqft else None,
@@ -344,10 +385,16 @@ def build_comp_rows(comps: List[Dict[str, Any]], subject: Dict[str, Any], subjec
             "Baths": c.get("totalBathrooms"),
             "Distance": dist,
             "Buyer / Current Owner": buyer_name(c),
+            "Sale Source": sale.get("source"),
+            "Verified Sale": "Yes" if sale.get("verified") else "Review",
             "Match": score,
         })
-    rows.sort(key=lambda r: (-r["Match"], r["Distance"] if r["Distance"] is not None else 99))
+    # Display order should be newest sold comp first. ARV uses a separate score-weighted calculation.
+    rows.sort(key=lambda r: (r["Sold Date Obj"] or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
     return rows
+
+def sort_for_arv(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(rows, key=lambda r: (-r["Match"], r["Distance"] if r["Distance"] is not None else 99))
 
 def arv_tiers(rows: List[Dict[str, Any]], subject: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     sqft = num(subject.get("livingArea") or subject.get("buildingArea"))
@@ -355,7 +402,7 @@ def arv_tiers(rows: List[Dict[str, Any]], subject: Dict[str, Any]) -> Tuple[Opti
         mv = num(subject.get("modelValue"))
         return (mv * .95 if mv else None, mv, mv * 1.05 if mv else None)
     vals = []
-    for r in rows[:10]:
+    for r in sort_for_arv(rows)[:10]:
         ppsf = r.get("$/SF")
         if ppsf:
             vals.append(ppsf * sqft)
@@ -373,7 +420,7 @@ def weighted_arv(rows: List[Dict[str, Any]], subject: Dict[str, Any]) -> Optiona
     if not rows: return None
     sqft = num(subject.get("livingArea") or subject.get("buildingArea"))
     if not sqft: return None
-    top = rows[:6]
+    top = sort_for_arv(rows)[:6]
     weights = []
     vals = []
     for r in top:
@@ -589,22 +636,24 @@ if analyze:
             st.stop()
         st.write("Finding comparable sales...")
         rules = [
-            {"label": "Ideal: 0.5 mi / 6 mo / same type / same bed-bath / ±300 sqft", "radius": 0.5, "months": 6, "sqft": True, "beds": True, "baths": True, "propertyType": subject_type},
-            {"label": "Fallback: 1.0 mi / 12 mo / same type / same bed-bath / ±300 sqft", "radius": 1.0, "months": 12, "sqft": True, "beds": True, "baths": True, "propertyType": subject_type},
-            {"label": "Fallback: 1.0 mi / 18 mo / same type / same bed-bath / ±300 sqft", "radius": 1.0, "months": 18, "sqft": True, "beds": True, "baths": True, "propertyType": subject_type},
-            {"label": "Closest available: 1.0 mi / 18 mo / any property type, filtered back to same type", "radius": 1.0, "months": 18, "sqft": False, "beds": True, "baths": True, "propertyType": "any"},
+            {"label": "Ideal: 0.5 mi / 6 mo / same type / same bed-bath / ±300 sqft", "radius": 0.5, "months": 6, "sqft": True, "beds": True, "baths": True, "propertyType": "any"},
+            {"label": "Strong: 1.0 mi / 6 mo / same type / same bed-bath / ±300 sqft", "radius": 1.0, "months": 6, "sqft": True, "beds": True, "baths": True, "propertyType": "any"},
+            {"label": "Standard: 1.0 mi / 12 mo / same type / same bed-bath / ±300 sqft", "radius": 1.0, "months": 12, "sqft": True, "beds": True, "baths": True, "propertyType": "any"},
+            {"label": "Backup: 1.0 mi / 12 mo / same type / ±300 sqft", "radius": 1.0, "months": 12, "sqft": True, "beds": False, "baths": False, "propertyType": "any"},
         ]
-        best_rows, best_resp, rule_used = [], None, None
+        all_comps = []
+        successful_labels = []
         for rule in rules:
             resp = comp_search(lat, lon, rule, subject_type, subject)
             if show_diag:
                 st.write(rule["label"]); st.json(resp)
             comps = (((resp.get("json") or {}).get("comparables")) or []) if resp.get("ok") else []
-            rows = build_comp_rows(comps, subject, subject_type)
-            if rows and (len(rows) >= int(min_comps) or not best_rows):
-                best_rows, best_resp, rule_used = rows, resp, rule
-            if len(rows) >= int(min_comps):
-                break
+            if comps:
+                all_comps.extend(comps)
+                successful_labels.append(rule["label"])
+
+        best_rows = build_comp_rows(all_comps, subject, subject_type)
+        rule_used = {"label": "Verified sweep: newest sales first; same property type locked; ±300 sqft preferred; 6 mo first, 12 mo backup"}
         status.update(label="Analysis complete", state="complete")
 
     # Subject Summary
@@ -624,14 +673,15 @@ if analyze:
 
     conservative_arv, expected_arv, aggressive_arv = arv_tiers(best_rows, subject)
     arv = conservative_arv or expected_arv or num(subject.get("modelValue"))
-    confidence = min(99, max(55, round((sum(r["Match"] for r in best_rows[:6]) / max(1, len(best_rows[:6])) / 150) * 100))) if best_rows else 55
+    arv_ranked_rows = sort_for_arv(best_rows)
+    confidence = min(99, max(55, round((sum(r["Match"] for r in arv_ranked_rows[:6]) / max(1, len(arv_ranked_rows[:6])) / 150) * 100))) if best_rows else 55
     st.subheader("ARV + Offer Matrix")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Conservative ARV", money(conservative_arv))
     c2.metric("Expected ARV", money(expected_arv))
     c3.metric("Aggressive ARV", money(aggressive_arv))
     c4.metric("Confidence", f"{confidence}%")
-    st.caption(f"Comps used: {min(len(best_rows), 6)} | Rule: {rule_used['label'] if rule_used else '—'}")
+    st.caption(f"Comps used for ARV: {min(len(arv_ranked_rows), 6)} | Total verified comps shown: {len(best_rows)} | Rule: {rule_used['label'] if rule_used else '—'}")
 
     st.markdown("#### Offer Matrix uses Conservative ARV")
     oc = st.columns(4)
@@ -642,7 +692,7 @@ if analyze:
         col.caption(f"After repairs: {money(after)}")
 
     st.subheader("Comparable Sales")
-    st.caption("Same property type locked. Buyer/current owner uses grantee first, then ownerName fallback.")
+    st.caption("Same property type locked. Sorted newest sold first. Buyer/current owner uses grantee first, then ownerName fallback. ARV is calculated from the highest-scoring comps, not simply the first rows shown.")
     if not best_rows:
         st.warning("No comps matched after filtering. Try enabling diagnostics or widening the criteria.")
     else:
@@ -658,6 +708,7 @@ if analyze:
                 "Baths": r["Baths"],
                 "Distance": f"{r['Distance']:.2f} mi" if r["Distance"] is not None else "—",
                 "Buyer / Current Owner": r["Buyer / Current Owner"],
+                "Verified": r["Verified Sale"],
                 "Match": f"{round((r['Match']/150)*100)}%",
             })
         st.dataframe(pd.DataFrame(display), use_container_width=True, hide_index=True)
@@ -671,8 +722,10 @@ if analyze:
                 dc1.write("**Mailing Address**")
                 dc1.write(c.get("ownerAddressFull") or "—")
                 dc2.write("**Sale / Transfer**")
-                dc2.write(f"Date: {fmt_date(sale_date(c))}")
-                dc2.write(f"Price: {money(sale_price(c))}")
+                dc2.write(f"Date: {r['Sold Date']}")
+                dc2.write(f"Price: {money(r['Sold Price'])}")
+                dc2.write(f"Source: {r.get('Sale Source', '—')}")
+                dc2.write(f"Verified: {r.get('Verified Sale', '—')}")
                 dc2.write(f"Doc: {c.get('transferDocType','—')} / {c.get('transferDocNum','—')}")
                 dc3.write("**Property Details**")
                 dc3.write(f"Parcel: {c.get('parcelId','—')}")

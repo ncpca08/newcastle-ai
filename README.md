@@ -1,29 +1,11 @@
-# Newcastle AI Realie Analyzer V7
+# Newcastle AI Realie Analyzer V8
 
-Adds:
-- Login page with admin/VA roles
-- Manual lead queue with status colors, assignment, lead lock, and notes
-- Cleaner sidebar with Realie badge hidden
-- Smarter address parsing for comma and non-comma lead formats
-- Conservative / Expected / Aggressive ARV tiers
-- SMS template auto-fills seller name and street address
+Adds bulletproof comp handling:
 
-## Streamlit Secrets
-
-Keep your Realie key:
-
-```toml
-REALIE_API_KEY = "your_realie_key_here"
-
-[users.marco]
-name = "Marco"
-password = "choose_a_password"
-role = "admin"
-
-[users.doreen]
-name = "Doreen"
-password = "choose_a_password"
-role = "va"
-```
-
-If `[users]` is not configured yet, the app will open as Marco/admin so you do not get locked out.
+- Comparable sales are displayed newest sold first.
+- Same property type lock remains enforced.
+- Uses a verified sale event parser to avoid showing non-sale transfer dates as comp sold dates.
+- Runs a Realie comparable sweep instead of stopping too early.
+- Keeps ±300 sqft as the preferred comp range and starts with 6 months before using 12-month backup.
+- ARV still uses best scored comps while the comp table displays newest sales first.
+- Buyer/current owner column remains included.
