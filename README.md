@@ -1,9 +1,13 @@
-# Newcastle AI - AVM Comps Display Fix
+# Newcastle AI Acquisition Analyzer
 
-Fixes comp display by treating RentCast AVM comparable sale listings as the comp source and using property records only for buyer/current-owner enrichment.
+Adds a temporary DealMachine API tester in the Streamlit sidebar.
 
-Key changes:
-- AVM comps now accept sale date fields like `lastSeenDate`, `removedDate`, or `daysOld` when `soldDate` is unavailable.
-- Property-record sale history no longer deletes AVM comps.
-- Offer boxes show true 75/70/65/60 of ARV before repairs.
-- Buyer/current owner enrichment remains in the table when address matching is available.
+Secrets required:
+
+```toml
+RENTCAST_API_KEY = "..."
+DEALMACHINE_API_KEY = "..."
+DEALRUN_API_KEY = "..."
+```
+
+Upload app.py, README.md, and requirements.txt to GitHub. Do not upload __pycache__.
