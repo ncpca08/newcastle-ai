@@ -20,7 +20,7 @@ def get_secret(name: str, default: str = "") -> str:
 
 RENTCAST_API_KEY = get_secret("RENTCAST_API_KEY")
 DEALRUN_API_KEY = get_secret("DEALRUN_API_KEY")
-REPLIERS_API_KEY = get_secret("REPLIERS_API_KEY")
+REALIE_API_KEY = get_secret("REALIE_API_KEY")
 
 # -------------------------
 # STYLE
@@ -538,6 +538,82 @@ def merge_comps(*lists):
 
 
 
+
+# -------------------------
+# REALIE API TESTER
+# -------------------------
+def realie_headers():
+    # Realie docs say to provide the API key directly in the Authorization header.
+    return {"Authorization": REALIE_API_KEY, "Accept": "application/json"}
+
+
+def realie_address_lookup(state: str, street_address: str, unit: str = "", city: str = "", county: str = ""):
+    if not REALIE_API_KEY:
+        return {"ok": False, "error": "Missing REALIE_API_KEY in Streamlit secrets."}
+    url = "https://app.realie.ai/api/public/property/address/"
+    params = {"state": state.strip().upper(), "address": street_address.strip()}
+    if unit.strip():
+        params["unitNumberStripped"] = unit.strip().replace("#", "").replace("UNIT", "").replace("APT", "").strip()
+    if city.strip():
+        params["city"] = city.strip()
+    if county.strip():
+        params["county"] = county.strip()
+    try:
+        r = requests.get(url, headers=realie_headers(), params=params, timeout=30)
+        try:
+            body = r.json()
+        except Exception:
+            body = None
+        return {
+            "ok": 200 <= r.status_code < 300,
+            "status_code": r.status_code,
+            "url_tested": url,
+            "params": params,
+            "content_type": r.headers.get("content-type", ""),
+            "body_preview": (r.text or "")[:4000],
+            "json": body if isinstance(body, (dict, list)) else None,
+        }
+    except Exception as e:
+        return {"ok": False, "url_tested": url, "params": params, "error": str(e)}
+
+
+def realie_comparables_search(latitude, longitude, radius=0.5, months=6, max_results=25, sqft_min=None, sqft_max=None, beds=None, baths=None, property_type="any"):
+    if not REALIE_API_KEY:
+        return {"ok": False, "error": "Missing REALIE_API_KEY in Streamlit secrets."}
+    url = "https://app.realie.ai/api/public/premium/comparables/"
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "radius": radius,
+        "timeFrame": months,
+        "maxResults": max_results,
+        "propertyType": property_type,
+    }
+    if sqft_min not in [None, ""]: params["sqftMin"] = int(float(sqft_min))
+    if sqft_max not in [None, ""]: params["sqftMax"] = int(float(sqft_max))
+    if beds not in [None, ""]:
+        params["bedsMin"] = int(float(beds)); params["bedsMax"] = int(float(beds))
+    if baths not in [None, ""]:
+        params["bathsMin"] = float(baths); params["bathsMax"] = float(baths)
+    try:
+        r = requests.get(url, headers=realie_headers(), params=params, timeout=30)
+        try:
+            body = r.json()
+        except Exception:
+            body = None
+        return {
+            "ok": 200 <= r.status_code < 300,
+            "status_code": r.status_code,
+            "url_tested": url,
+            "params": params,
+            "content_type": r.headers.get("content-type", ""),
+            "body_preview": (r.text or "")[:4000],
+            "json": body if isinstance(body, (dict, list)) else None,
+        }
+    except Exception as e:
+        return {"ok": False, "url_tested": url, "params": params, "error": str(e)}
+
+
 # -------------------------
 # DEALRUN API TESTER (temporary discovery tool)
 # -------------------------
@@ -740,54 +816,6 @@ def calculate_arv(comps, subject_sqft, avm_data=None):
     arv = avg_psf * float(subject_sqft) if avg_psf and subject_sqft else median_price
     return arv, avg_psf, median_price
 
-
-def test_repliers_api(base_url: str, endpoint: str, method: str, auth_style: str, address: str):
-    if not REPLIERS_API_KEY:
-        return {"ok": False, "error": "Missing REPLIERS_API_KEY in Streamlit secrets."}
-
-    base_url = base_url.rstrip("/")
-    endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
-    url = f"{base_url}{endpoint}"
-    headers = {"Accept": "application/json"}
-    params = {}
-
-    if auth_style == "X-API-Key":
-        headers["X-API-Key"] = REPLIERS_API_KEY
-    elif auth_style == "REPLIERS-API-KEY":
-        headers["REPLIERS-API-KEY"] = REPLIERS_API_KEY
-    elif auth_style == "Authorization Bearer":
-        headers["Authorization"] = f"Bearer {REPLIERS_API_KEY}"
-    elif auth_style == "Authorization Token":
-        headers["Authorization"] = f"Token {REPLIERS_API_KEY}"
-    elif auth_style == "api_key query":
-        params["api_key"] = REPLIERS_API_KEY
-
-    if address:
-        params.update({"address": address, "query": address, "q": address})
-
-    try:
-        if method == "GET":
-            r = requests.get(url, headers=headers, params=params, timeout=30)
-        else:
-            payload = {"address": address} if address else {}
-            r = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=payload, params=params, timeout=30)
-        out = {
-            "ok": 200 <= r.status_code < 300,
-            "status_code": r.status_code,
-            "url_tested": r.url.replace(REPLIERS_API_KEY, "***"),
-            "auth_mode": auth_style,
-            "method": method,
-            "content_type": r.headers.get("content-type", ""),
-            "body_preview": r.text[:5000],
-        }
-        try:
-            out["json"] = r.json()
-        except Exception:
-            out["json"] = None
-        return out
-    except Exception as e:
-        return {"ok": False, "url_tested": url, "auth_mode": auth_style, "method": method, "error": str(e)}
-
 # -------------------------
 # UI
 # -------------------------
@@ -800,6 +828,44 @@ with st.sidebar:
     st.caption("Turn this off after your Streamlit secrets are added.")
     repair_estimate = st.number_input("Repair Estimate", min_value=0, value=58000, step=1000)
     min_comps = st.number_input("Minimum comps before fallback", min_value=1, max_value=10, value=3)
+
+
+    st.divider()
+    st.header("Realie API Test")
+    st.caption("Add REALIE_API_KEY in Streamlit Secrets first. Start with Address Lookup.")
+    realie_test_type = st.selectbox("Realie test type", ["Address Lookup", "Comparables Search"], index=0)
+    if realie_test_type == "Address Lookup":
+        realie_state = st.text_input("State", value="CA")
+        realie_street = st.text_input("Street address only", value="1342 Branham Ln")
+        realie_unit = st.text_input("Unit only", value="1")
+        realie_city = st.text_input("City", value="San Jose")
+        realie_county = st.text_input("County", value="Santa Clara")
+        if st.button("Test Realie Address Lookup", use_container_width=True):
+            result = realie_address_lookup(realie_state, realie_street, realie_unit, realie_city, realie_county)
+            st.write("Realie address lookup result")
+            st.json(result)
+    else:
+        st.caption("Use latitude/longitude from the Address Lookup response if available.")
+        realie_lat = st.text_input("Latitude", value="")
+        realie_lon = st.text_input("Longitude", value="")
+        realie_radius = st.number_input("Radius miles", min_value=0.1, value=0.5, step=0.1)
+        realie_months = st.number_input("Months back", min_value=1, value=6, step=1)
+        realie_sqft_min = st.text_input("SqFt min", value="510")
+        realie_sqft_max = st.text_input("SqFt max", value="1110")
+        realie_beds = st.text_input("Beds exact", value="2")
+        realie_baths = st.text_input("Baths exact", value="1")
+        realie_type = st.selectbox("Property type", ["condo", "house", "any"], index=0)
+        if st.button("Test Realie Comparables", use_container_width=True):
+            if not realie_lat or not realie_lon:
+                st.error("Latitude and longitude are required for Realie comparables.")
+            else:
+                result = realie_comparables_search(
+                    realie_lat, realie_lon, realie_radius, realie_months, 25,
+                    realie_sqft_min, realie_sqft_max, realie_beds, realie_baths, realie_type
+                )
+                st.write("Realie comparables result")
+                st.json(result)
+
 
     st.divider()
     st.header("DealRun API Test")
@@ -816,27 +882,6 @@ with st.sidebar:
     if st.button("Test DealRun API", use_container_width=True):
         result = dealrun_request(dealrun_base, dealrun_path, dealrun_method, dealrun_auth, dealrun_addr)
         st.write("DealRun test result")
-        st.json(result)
-
-    st.divider()
-    st.header("Repliers API Test")
-    st.caption("Temporary tester. Add REPLIERS_API_KEY in Streamlit Secrets first.")
-    repliers_base = st.selectbox(
-        "Repliers Base URL",
-        ["https://api.repliers.io", "https://api.repliers.com", "https://api.repliers.io/v1"],
-        index=0,
-    )
-    repliers_path = st.text_input("Repliers endpoint path", value="/", help="Start with /. Then try /listings or a documented endpoint if Repliers provides one.")
-    repliers_method = st.selectbox("Repliers method", ["GET", "POST"], index=0)
-    repliers_auth = st.selectbox(
-        "Repliers auth style",
-        ["X-API-Key", "REPLIERS-API-KEY", "Authorization Bearer", "Authorization Token", "api_key query"],
-        index=0,
-    )
-    repliers_addr = st.text_input("Repliers optional test address", value="1342 Branham Ln #1, San Jose, CA 95118")
-    if st.button("Test Repliers API", use_container_width=True):
-        result = test_repliers_api(repliers_base, repliers_path, repliers_method, repliers_auth, repliers_addr)
-        st.write("Repliers test result")
         st.json(result)
 
 
