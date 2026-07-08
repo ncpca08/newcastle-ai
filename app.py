@@ -81,6 +81,68 @@ def normalize_address(address: str) -> str:
     return re.sub(r"\s+", " ", address.strip())
 
 
+def safe_float(value):
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def haversine_miles(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(safe_float, [lat1, lon1, lat2, lon2])
+    if None in [lat1, lon1, lat2, lon2]:
+        return None
+    r = 3958.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def owner_name(record):
+    if not isinstance(record, dict):
+        return None
+    owner = record.get("owner")
+    if isinstance(owner, dict):
+        names = owner.get("names") or []
+        if names:
+            return ", ".join([str(n) for n in names if n])
+        if owner.get("name"):
+            return owner.get("name")
+    return comp_field(record, "buyerName", "buyer", "ownerName", "currentOwnerName")
+
+
+def latest_sale(record):
+    """Return most recent sale date/price from direct fields or RentCast history."""
+    sale_date = comp_field(record, "soldDate", "lastSaleDate", "saleDate", "closeDate")
+    sale_price = comp_field(record, "soldPrice", "lastSalePrice", "salePrice", "price")
+    history = record.get("history") if isinstance(record, dict) else None
+    if isinstance(history, dict) and history:
+        sale_events = []
+        for key, event in history.items():
+            if not isinstance(event, dict):
+                continue
+            d = event.get("date") or key
+            dt = parse_date(d)
+            price = event.get("price")
+            if dt and price:
+                sale_events.append((dt, d, price))
+        if sale_events:
+            sale_events.sort(key=lambda x: x[0], reverse=True)
+            sale_date = sale_date or sale_events[0][1]
+            sale_price = sale_price or sale_events[0][2]
+    return sale_date, sale_price
+
+
+def same_property_address(a, b):
+    def clean(x):
+        return re.sub(r"[^A-Z0-9]", "", str(x or "").upper())
+    return clean(a) and clean(a) == clean(b)
+
+
 def maps_links(address: str):
     q = quote_plus(address)
     return {
@@ -184,6 +246,112 @@ def get_value_and_comps(address: str, radius: float = 1.0):
         return None, f"RentCast AVM lookup failed: {r.status_code} {r.text[:300]}"
     return r.json(), None
 
+def rentcast_property_type_values(subject_family: str):
+    if subject_family == "Condo":
+        return ["Condo", "Townhouse"]
+    if subject_family == "Townhome":
+        return ["Townhouse", "Condo"]
+    if subject_family == "Single Family":
+        return ["Single Family"]
+    if subject_family == "Multifamily":
+        return ["Multi-Family", "Apartment"]
+    if subject_family == "Manufactured":
+        return ["Manufactured"]
+    return []
+
+
+def get_sold_property_records(address: str, subject_attrs: dict, radius: float = 1.0, days: int = 365, sqft_tolerance: int = 700, strict_type: bool = True, strict_beds: bool = False, strict_baths: bool = False):
+    """Pull nearby SOLD property records from RentCast /v1/properties.
+    This is separate from the AVM endpoint and is what powers the detailed comp table.
+    """
+    if not RENTCAST_API_KEY:
+        return [], "Missing RentCast API key. Add it in Streamlit secrets."
+
+    subject_family = subject_attrs.get("family", "Unknown")
+    ssqft = safe_float(subject_attrs.get("sqft"))
+    sbeds = subject_attrs.get("beds")
+    sbaths = subject_attrs.get("baths")
+    query_types = rentcast_property_type_values(subject_family) if strict_type else [None]
+    if not query_types:
+        query_types = [None]
+
+    all_records = []
+    errors = []
+    url = "https://api.rentcast.io/v1/properties"
+
+    for property_type in query_types:
+        params = {
+            "address": address,
+            "radius": radius,
+            "saleDateRange": str(days),
+            "limit": 500,
+        }
+        if property_type:
+            params["propertyType"] = property_type
+        if strict_beds and sbeds is not None:
+            params["bedrooms"] = str(int(round(float(sbeds))))
+        if strict_baths and sbaths is not None:
+            params["bathrooms"] = str(float(sbaths)).rstrip('0').rstrip('.')
+        if ssqft and sqft_tolerance:
+            params["squareFootage"] = f"{max(0, int(ssqft - sqft_tolerance))}-{int(ssqft + sqft_tolerance)}"
+
+        try:
+            r = requests.get(url, headers=rentcast_headers(), params=params, timeout=30)
+            if r.status_code != 200:
+                errors.append(f"Property records comp search failed: {r.status_code} {r.text[:180]}")
+                continue
+            data = r.json()
+            if isinstance(data, list):
+                all_records.extend(data)
+            elif isinstance(data, dict) and isinstance(data.get("data"), list):
+                all_records.extend(data.get("data"))
+        except Exception as e:
+            errors.append(f"Property records comp search error: {e}")
+
+    # Deduplicate by RentCast id or address
+    unique = {}
+    for rec in all_records:
+        key = rec.get("id") or rec.get("formattedAddress") or str(rec)
+        unique[key] = rec
+    return list(unique.values()), "; ".join(errors) if errors else None
+
+
+def normalize_comp_record(record, subject_attrs=None):
+    c = dict(record or {})
+    sale_date, sale_price = latest_sale(c)
+    if sale_date is not None:
+        c["soldDate"] = sale_date
+    if sale_price is not None:
+        c["soldPrice"] = sale_price
+    buyer = owner_name(c)
+    if buyer:
+        c["buyerName"] = buyer
+    if subject_attrs:
+        dist = comp_field(c, "distance", "distanceMiles")
+        if dist is None:
+            dist = haversine_miles(subject_attrs.get("lat"), subject_attrs.get("lon"), c.get("latitude"), c.get("longitude"))
+        if dist is not None:
+            c["distance"] = dist
+    c["_source"] = c.get("_source") or "RentCast Records"
+    return c
+
+
+def merge_comps(*lists):
+    merged = {}
+    for items in lists:
+        for item in items or []:
+            addr = item.get("formattedAddress") or item.get("address") or item.get("addressLine1") or str(item)
+            key = re.sub(r"[^A-Z0-9]", "", str(addr).upper())
+            if key not in merged:
+                merged[key] = item
+            else:
+                # Prefer record data because it usually has owner/buyer and sale history.
+                existing = merged[key]
+                combined = dict(existing)
+                combined.update({k:v for k,v in item.items() if v not in [None, "", []]})
+                merged[key] = combined
+    return list(merged.values())
+
 # -------------------------
 # SAMPLE DATA FOR PREVIEW
 # -------------------------
@@ -232,6 +400,8 @@ def get_subject_attrs(subject, avm_data):
         "owner": owner,
         "family": property_family(merged),
         "raw_type": raw_property_type(merged) or "Unknown",
+        "lat": merged.get("latitude"),
+        "lon": merged.get("longitude"),
     }
 
 
@@ -242,14 +412,18 @@ def filter_comps(raw_comps, subject_attrs, months=6, radius=0.5, sqft_tolerance=
     subject_family = subject_attrs.get("family", "Unknown")
     filtered = []
     for c in raw_comps:
-        sale_date = parse_date(comp_field(c, "soldDate", "lastSaleDate", "saleDate", "closeDate"))
-        sold_price = comp_field(c, "soldPrice", "lastSalePrice", "salePrice", "price")
+        raw_sale_date, raw_sold_price = latest_sale(c)
+        sale_date = parse_date(raw_sale_date)
+        sold_price = raw_sold_price
         beds = comp_field(c, "bedrooms", "beds")
         baths = comp_field(c, "bathrooms", "baths")
         sqft = comp_field(c, "squareFootage", "sqft", "livingArea")
         dist = comp_field(c, "distance", "distanceMiles")
         status = str(comp_field(c, "status", "listingStatus") or "sold").lower()
         comp_family = property_family(c)
+        comp_addr = comp_field(c, "formattedAddress", "address", "addressLine1")
+        if same_property_address(comp_addr, subject_attrs.get("address")):
+            continue
 
         if not sale_date or not sold_price:
             continue
@@ -272,6 +446,10 @@ def filter_comps(raw_comps, subject_attrs, months=6, radius=0.5, sqft_tolerance=
         c2["_sold_price"] = float(sold_price)
         c2["_sqft"] = float(sqft) if sqft else None
         c2["_family"] = comp_family
+        c2["soldDate"] = raw_sale_date
+        c2["soldPrice"] = sold_price
+        c2["buyerName"] = owner_name(c2) or comp_field(c2, "buyerName", "buyer", "ownerName", "owner")
+        c2["_source"] = c2.get("_source") or "RentCast"
         filtered.append(c2)
     filtered.sort(key=lambda x: x["_sale_date"], reverse=True)
     return filtered
@@ -346,15 +524,31 @@ if analyze:
     errors = []
     if use_sample:
         subject_record, avm_data, err = sample_result()
-        raw_comps = extract_comps(avm_data)
+        subject_attrs = get_subject_attrs(subject_record, avm_data)
+        raw_comps = [normalize_comp_record(c, subject_attrs) for c in extract_comps(avm_data)]
+        record_count = len(raw_comps)
+        avm_count = len(raw_comps)
     else:
         subject_record, err = get_property_record(address)
         if err: errors.append(err)
         avm_data, err = get_value_and_comps(address, radius=1.0)
         if err: errors.append(err)
-        raw_comps = extract_comps(avm_data)
+        subject_attrs = get_subject_attrs(subject_record, avm_data)
 
-    subject_attrs = get_subject_attrs(subject_record, avm_data)
+        avm_comps = [normalize_comp_record(c, subject_attrs) for c in extract_comps(avm_data)]
+
+        # Pull detailed SOLD comps from RentCast Property Records. This is what gives us
+        # last sale price/date and current owner/buyer names for the comp table.
+        record_comps_12, err = get_sold_property_records(address, subject_attrs, radius=1.0, days=365, sqft_tolerance=700, strict_type=True, strict_beds=False, strict_baths=False)
+        if err: errors.append(err)
+        record_comps_24, err = get_sold_property_records(address, subject_attrs, radius=1.5, days=730, sqft_tolerance=900, strict_type=True, strict_beds=False, strict_baths=False) if len(record_comps_12) < min_comps else ([], None)
+        if err: errors.append(err)
+        record_comps = [normalize_comp_record(c, subject_attrs) for c in (record_comps_12 + record_comps_24)]
+
+        raw_comps = merge_comps(record_comps, avm_comps)
+        record_count = len(record_comps)
+        avm_count = len(avm_comps)
+
     comps, comp_window = find_best_comps(raw_comps, subject_attrs, min_comps=min_comps)
 
     if errors:
@@ -370,6 +564,7 @@ if analyze:
     c5.metric("Lot SqFt", number(subject_attrs.get("lot")))
     c6.metric("Year Built", subject_attrs.get("year") or "—")
     st.caption(f"Raw property type returned by data source: {subject_attrs.get('raw_type') or 'Unknown'}")
+    st.caption(f"Comp data pulled: {len(raw_comps)} total candidates ({record_count} property records + {avm_count} AVM comps).")
 
     arv, avg_psf, median_price = calculate_arv(comps, subject_attrs.get("sqft"), avm_data)
     st.subheader("ARV + Offer Matrix")
@@ -387,15 +582,33 @@ if analyze:
         col.caption(f"{label} - repairs")
 
     st.subheader("Sold Comparable Sales")
-    st.caption("SOLD comps only. The system now matches property type first: condo/townhome vs single-family vs multifamily.")
+    st.caption("SOLD comps only. Pulls RentCast Property Records first for buyer/current-owner names, then blends AVM comps. Property type is matched first: condo/townhome vs single-family vs multifamily.")
 
     if not comps:
-        st.warning("No comps matched, even after fallback rules. Review the subject manually or widen criteria.")
+        st.warning("No comps matched after filtering. The app did pull candidate records above; next step is to review/widen the criteria or inspect source fields.")
+        if raw_comps:
+            with st.expander("Show raw comp candidates for troubleshooting"):
+                preview = []
+                for c in raw_comps[:25]:
+                    sale_date, sale_price = latest_sale(c)
+                    preview.append({
+                        "Address": comp_field(c, "formattedAddress", "address", "addressLine1"),
+                        "Type": raw_property_type(c) or c.get("propertyType"),
+                        "Beds": comp_field(c, "bedrooms", "beds"),
+                        "Baths": comp_field(c, "bathrooms", "baths"),
+                        "SqFt": comp_field(c, "squareFootage", "sqft", "livingArea"),
+                        "Sale Date": fmt_date(sale_date),
+                        "Sale Price": money(sale_price) if sale_price else "—",
+                        "Buyer/Owner": owner_name(c) or "—",
+                        "Distance": comp_field(c, "distance", "distanceMiles"),
+                        "Source": c.get("_source", "RentCast"),
+                    })
+                st.dataframe(pd.DataFrame(preview), hide_index=True, use_container_width=True)
     else:
         rows = []
         for c in comps:
             comp_addr = comp_field(c, "formattedAddress", "address", "addressLine1") or "Unknown address"
-            buyer = comp_field(c, "buyerName", "buyer", "ownerName", "owner") or "Buyer name pending"
+            buyer = owner_name(c) or comp_field(c, "buyerName", "buyer", "ownerName", "owner") or "Buyer name pending"
             investor = is_likely_investor(str(buyer))
             sqft = comp_field(c, "squareFootage", "sqft", "livingArea")
             lot = comp_field(c, "lotSize", "lotSquareFootage")
@@ -417,6 +630,7 @@ if analyze:
                 "Recorded Sale Price": money(sold_price),
                 "Buyer": buyer,
                 "Investor?": "YES" if investor else "NO",
+                "Source": c.get("_source", "RentCast"),
                 "Redfin": links["Redfin"],
                 "Zillow": links["Zillow"],
                 "Map": links["Map"],
