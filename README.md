@@ -1,28 +1,24 @@
-# Newcastle AI Acquisition Analyzer
+# Newcastle OS — Realie.ai Wholesale Analyzer
 
-Streamlit MVP for Newcastle Partners CA LLC.
+Streamlit wholesale acquisition platform for Newcastle Partners CA LLC.
 
-## Features
-- Address-based property analysis
-- RentCast API hooks for property data and sold comps
-- DealMachine API hook placeholder for buyer/owner enrichment
-- Sold comps only
-- 6-month comp window first, fallback to 12 months
-- Exact beds/baths and +/- 300 sqft filters
-- Lot sqft display
-- MM/DD/YYYY sold date format
-- Most recent sold comps first
-- Buyer name / likely investor flag
-- Redfin, Google Maps, Street View, Satellite links
-- Photo upload and Dropbox/Google Drive photo link field
-- 75%, 70%, 65%, and 60% ARV MAO tiers minus repairs
+## Live workflow
+1. Enter a complete US property address.
+2. Realie.ai Address Lookup retrieves the subject property and coordinates.
+3. Realie.ai Premium Comparables searches sold comps using:
+   - 0.50-mile default radius
+   - Same property type
+   - Exact bedroom and bathroom counts
+   - ±300 square feet by default
+   - Six months first
+   - Twelve-month fallback only when the minimum comp count is not met
+4. Newcastle OS calculates average comp ARV, PSF validation, buyer ceiling, and wholesale MAO.
+5. The saved analysis transfers into the Fillout contract builder.
 
 ## Streamlit secrets
-Do not commit API keys to GitHub. Add them in Streamlit Community Cloud under Advanced settings:
-
 ```toml
-RENTCAST_API_KEY = "your_rentcast_key_here"
-DEALMACHINE_API_KEY = "your_dealmachine_key_here"
+REALIE_API_KEY = "your_realie_api_key"
+FILLOUT_FORM_URL = "https://form.fillout.com/t/your-form"
 ```
 
 ## Local run
