@@ -144,7 +144,14 @@ def realie_property_type(value: Any) -> str:
     return "any"
 
 
-def get_comparables(subject: dict[str, Any], months: int, radius: float, sqft_tolerance: int, max_results: int = 50) -> tuple[list[dict[str, Any]], str | None]:
+def get_comparables(
+    subject: dict[str, Any],
+    months: int,
+    radius: float,
+    sqft_tolerance: int,
+    max_results: int = 50,
+    use_sqft_filter: bool = True,
+) -> tuple[list[dict[str, Any]], str | None]:
     lat = subject.get("latitude")
     lon = subject.get("longitude")
     if lat is None or lon is None:
@@ -160,7 +167,7 @@ def get_comparables(subject: dict[str, Any], months: int, radius: float, sqft_to
     sqft = subject.get("sqft")
     beds = subject.get("beds")
     baths = subject.get("baths")
-    if sqft is not None:
+    if use_sqft_filter and sqft is not None:
         params["sqftMin"] = max(0, int(float(sqft)) - sqft_tolerance)
         params["sqftMax"] = int(float(sqft)) + sqft_tolerance
     if beds is not None:
@@ -230,6 +237,72 @@ def clean_comps(raw_comps: list[dict[str, Any]], subject_address: str) -> list[d
     cleaned.sort(key=lambda c: c["sold_date"], reverse=True)
     return cleaned
 
+
+
+def qualify_bed_bath_fallback_comps(
+    comps: list[dict[str, Any]],
+    subject: dict[str, Any],
+    sqft_tolerance: int,
+) -> list[dict[str, Any]]:
+    """Allow missing-sqft comps, but never allow a known sqft outside tolerance.
+
+    Beds and baths are requested exactly from Realie; this function also applies a
+    local safeguard in case the API returns a broader record.
+    """
+    subject_beds = subject.get("beds")
+    subject_baths = subject.get("baths")
+    subject_sqft = subject.get("sqft")
+    qualified: list[dict[str, Any]] = []
+
+    for comp in comps:
+        comp_beds = comp.get("beds")
+        comp_baths = comp.get("baths")
+        comp_sqft = comp.get("sqft")
+
+        try:
+            if subject_beds is not None and comp_beds is not None:
+                if int(round(float(comp_beds))) != int(round(float(subject_beds))):
+                    continue
+            if subject_baths is not None and comp_baths is not None:
+                if float(comp_baths) != float(subject_baths):
+                    continue
+        except (TypeError, ValueError):
+            continue
+
+        # Missing comp sqft is the explicit fallback case requested by Newcastle.
+        if comp_sqft is None:
+            qualified.append(comp)
+            continue
+
+        # Known sqft must still satisfy the normal Newcastle tolerance.
+        if subject_sqft is not None:
+            try:
+                if abs(float(comp_sqft) - float(subject_sqft)) <= sqft_tolerance:
+                    qualified.append(comp)
+            except (TypeError, ValueError):
+                continue
+        else:
+            qualified.append(comp)
+
+    qualified.sort(key=lambda c: c["sold_date"], reverse=True)
+    return qualified
+
+
+def merge_comps(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, float, str]] = set()
+    for group in groups:
+        for comp in group:
+            key = (
+                re.sub(r"\W", "", comp["address"]).lower(),
+                float(comp["sold_price"]),
+                str(comp["sold_date"].date()),
+            )
+            if key not in seen:
+                seen.add(key)
+                merged.append(comp)
+    merged.sort(key=lambda c: c["sold_date"], reverse=True)
+    return merged
 
 def redfin_link(address: str) -> str:
     # Redfin's hash search often drops users on the homepage. A site-restricted exact-address
@@ -309,19 +382,68 @@ if page == "Wholesale Analyzer":
                     st.error(subject_error)
                 else:
                     subject = subject_fields(subject_raw, normalize)
-                    comps_6_raw, comps_6_error = get_comparables(subject, 6, radius, int(sqft_tolerance))
-                    comps_6 = clean_comps(comps_6_raw, normalize) if not comps_6_error else []
-                    window = "Last 6 months"
+                    tolerance = int(sqft_tolerance)
+                    minimum = int(min_comps)
+
+                    # 1) Start with Newcastle's strict six-month sqft-filtered search.
+                    comps_6_raw, comps_6_error = get_comparables(
+                        subject, 6, radius, tolerance, use_sqft_filter=True
+                    )
+                    strict_6 = clean_comps(comps_6_raw, normalize) if not comps_6_error else []
+                    comps = strict_6
+                    window = "Last 6 months · strict sqft"
                     warning = comps_6_error
-                    comps = comps_6
-                    if len(comps_6) < int(min_comps):
-                        comps_12_raw, comps_12_error = get_comparables(subject, 12, radius, int(sqft_tolerance))
-                        if not comps_12_error:
-                            comps = clean_comps(comps_12_raw, normalize)
-                            window = "12-month fallback"
-                            warning = None
+                    fallback_used = False
+
+                    # 2) If strict results are insufficient, repeat the six-month search
+                    # without an API sqft restriction. Locally accept only records whose
+                    # sqft is missing or whose known sqft still falls within tolerance.
+                    if len(comps) < minimum:
+                        broad_6_raw, broad_6_error = get_comparables(
+                            subject, 6, radius, tolerance, use_sqft_filter=False
+                        )
+                        if not broad_6_error:
+                            broad_6 = clean_comps(broad_6_raw, normalize)
+                            fallback_6 = qualify_bed_bath_fallback_comps(broad_6, subject, tolerance)
+                            comps = merge_comps(strict_6, fallback_6)
+                            if len(comps) > len(strict_6):
+                                fallback_used = True
+                                window = "Last 6 months · bed/bath fallback for missing sqft"
+                                warning = None
                         elif not warning:
-                            warning = comps_12_error
+                            warning = broad_6_error
+
+                    # 3) Only then expand the sale window to twelve months, preserving
+                    # the exact same strict-then-missing-sqft fallback sequence.
+                    if len(comps) < minimum:
+                        strict_12_raw, strict_12_error = get_comparables(
+                            subject, 12, radius, tolerance, use_sqft_filter=True
+                        )
+                        strict_12 = clean_comps(strict_12_raw, normalize) if not strict_12_error else []
+                        comps_12 = strict_12
+                        if len(comps_12) < minimum:
+                            broad_12_raw, broad_12_error = get_comparables(
+                                subject, 12, radius, tolerance, use_sqft_filter=False
+                            )
+                            if not broad_12_error:
+                                broad_12 = clean_comps(broad_12_raw, normalize)
+                                fallback_12 = qualify_bed_bath_fallback_comps(broad_12, subject, tolerance)
+                                comps_12 = merge_comps(strict_12, fallback_12)
+                                if len(comps_12) > len(strict_12):
+                                    fallback_used = True
+                            elif not warning:
+                                warning = broad_12_error
+                        elif strict_12_error and not warning:
+                            warning = strict_12_error
+
+                        comps = comps_12
+                        window = (
+                            "12-month fallback · includes missing-sqft bed/bath comps"
+                            if fallback_used
+                            else "12-month fallback · strict sqft"
+                        )
+                        if comps:
+                            warning = None
                     values = calculate_values(comps, subject.get("sqft"))
                     # Recommended ARV is the average sold comp price, exactly as requested.
                     arv = values["average_price"]
@@ -341,6 +463,7 @@ if page == "Wholesale Analyzer":
                         "assignment_fee": assignment_fee,
                         "buyer_percentage": buyer_percentage,
                         "other_costs": other_costs,
+                        "missing_sqft_fallback_used": fallback_used,
                     }
 
     result = st.session_state.analysis
@@ -371,7 +494,9 @@ if page == "Wholesale Analyzer":
             st.warning(result["warning"])
 
         st.markdown("### Sold comparable sales")
-        st.caption("Realie.ai only · sold records · same property type · exact beds/baths · ±300 sq. ft. by default · 0.50 miles by default · newest first")
+        st.caption("Realie.ai only · sold records · same property type · exact beds/baths · known sqft must stay within tolerance · missing sqft may be included only as a fallback · newest first")
+        if result.get("missing_sqft_fallback_used"):
+            st.info("Missing-square-footage fallback used: these comps still match the required bed and bath count. Any comp with known square footage outside your selected tolerance remains excluded.")
         if not result["comps"]:
             st.warning("No qualifying comps were returned for this property. No prior property's comps are being shown.")
         else:
@@ -403,51 +528,13 @@ if page == "Wholesale Analyzer":
 
 elif page == "Contract Builder":
     st.markdown('<div class="eyebrow">FILLOUT WORKFLOW</div>', unsafe_allow_html=True)
-    st.markdown('<div class="hero">Contract builder</div>', unsafe_allow_html=True)
-    analysis = st.session_state.analysis or {}
-    subject = analysis.get("subject", {})
-    with st.form("contract_form"):
-        property_address = st.text_input("Property address", value=analysis.get("query_address", ""))
-        c1, c2, c3 = st.columns(3)
-        purchase_price = c1.number_input("Purchase price", min_value=0, value=int(analysis.get("mao") or 0), step=1000)
-        closing_date = c2.date_input("Closing date", value=date.today() + timedelta(days=21))
-        arv = c3.number_input("ARV", min_value=0, value=int(analysis.get("arv") or 0), step=1000)
-        s1, s2, s3 = st.columns(3)
-        seller_name = s1.text_input("Seller name")
-        seller_email = s2.text_input("Seller email")
-        seller_phone = s3.text_input("Seller phone")
-        e1, e2, e3 = st.columns(3)
-        escrow_company = e1.text_input("Escrow company")
-        escrow_officer = e2.text_input("Escrow officer")
-        escrow_email = e3.text_input("Escrow email")
-        b1, b2, b3 = st.columns(3)
-        buyer_name = b1.text_input("End buyer / entity")
-        buyer_email = b2.text_input("Buyer email")
-        assignment = b3.number_input("Assignment fee", min_value=0, value=int(analysis.get("assignment_fee") or 0), step=1000)
-        notes = st.text_area("Deal notes")
-        build = st.form_submit_button("Create prefilled Fillout link", use_container_width=True)
-    if build:
-        if not FILLOUT_FORM_URL:
-            st.error("Add FILLOUT_FORM_URL to Streamlit secrets first.")
-        else:
-            params = {
-                "property_address": property_address,
-                "purchase_price": purchase_price,
-                "closing_date": closing_date.isoformat(),
-                "arv": arv,
-                "seller_name": seller_name,
-                "seller_email": seller_email,
-                "seller_phone": seller_phone,
-                "escrow_company": escrow_company,
-                "escrow_officer": escrow_officer,
-                "escrow_email": escrow_email,
-                "buyer_name": buyer_name,
-                "buyer_email": buyer_email,
-                "assignment_fee": assignment,
-                "notes": notes,
-            }
-            query = "&".join(f"{quote_plus(str(k))}={quote_plus(str(v))}" for k, v in params.items() if v not in (None, ""))
-            separator = "&" if "?" in FILLOUT_FORM_URL else "?"
-            url = FILLOUT_FORM_URL + separator + query
-            st.link_button("Open Fillout contract form", url, use_container_width=True)
-            st.caption("Exact Fillout field IDs can be mapped after you provide the form's field references.")
+    st.markdown('<div class="hero">Open the contract form</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="muted">For now, Newcastle OS sends you directly to the existing Fillout → DocuSign workflow.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="panel">Use your existing Fillout form to enter the property, seller, escrow, buyer, price, and closing information.</div>', unsafe_allow_html=True)
+    if FILLOUT_FORM_URL:
+        st.link_button("Open Fillout contract form", FILLOUT_FORM_URL, use_container_width=True)
+    else:
+        st.error("Add FILLOUT_FORM_URL to Streamlit secrets to activate this button.")
